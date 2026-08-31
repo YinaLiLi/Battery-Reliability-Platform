@@ -1,5 +1,6 @@
 certifi==2026.7.22
 charset-normalizer==3.5.1
+confluent-kafka==2.13.2
 idna==3.19
 numpy==2.5.2
 pyarrow==22.0.0
