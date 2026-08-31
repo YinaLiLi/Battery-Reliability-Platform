@@ -81,6 +81,30 @@ This is a batch-only milestone. Kafka Structured Streaming comes after these
 plans and data movements are familiar; its event-time windows are not a direct
 replacement for the row-based `lag` window used here.
 
+## Airflow batch orchestration
+
+Airflow 3.3.1 provides a manually triggered local DAG for the existing batch
+chain: NASA download, cycle parsing, fleet simulation, then Spark feature
+generation. Start the Spark cluster separately, then start Airflow:
+
+```sh
+docker compose build spark-master airflow
+docker compose up -d spark-master spark-worker-1 spark-worker-2 airflow
+```
+
+Open `http://localhost:8083`, use the one-time credentials printed by
+`docker compose logs airflow`, and trigger `fleet_batch_pipeline` manually.
+The DAG permits one active run because every task regenerates the existing
+fixed paths under `data/processed/`; retries are therefore safe and do not
+create competing artifacts.
+
+The Airflow container runs on the same Compose network and submits directly to
+`spark://spark-master:7077`; it does not control the Spark services or require
+Docker socket access. Kafka, the Kafka producer/consumer, and Structured
+Streaming remain independently run services and are intentionally outside this
+DAG. Model comparison also remains manual so its frozen evaluation reports are
+not casually regenerated.
+
 ## Kafka → PySpark Structured Streaming
 
 Start Kafka and the existing Spark cluster, publish telemetry, then run the
@@ -114,7 +138,8 @@ Run the local model comparison after generating the PySpark feature dataset:
 ```
 
 The script makes vehicle-disjoint train/validation/test cohorts over the shared
-calendar horizon, compares logistic regression, random forest, and XGBoost, and
+calendar horizon, stratified by region, battery type, and first-positive-risk
+timing band. It compares logistic regression, random forest, and XGBoost, and
 writes the frozen primary evaluation to
 `data/processed/primary_model_comparison_metrics.json`. It separately writes a
 time-only stress test for the primary-selected configuration to
@@ -131,19 +156,38 @@ DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix libomp)/lib" .venv/bin/python src/mo
 
 The primary task is predicting `failure_within_30_operating_days` for unseen
 vehicles. The authoritative benchmark uses exact 60/20/20 vehicle-disjoint
-cohorts over the shared 2025-01-01 through 2025-03-31 horizon. Logistic
-regression was selected by the predefined validation PR-AUC rule with the
-simplicity tie-breaker: XGBoost depth 5 reached PR-AUC 0.165 and logistic
-regression 0.162, within the 0.005 tolerance.
+cohorts over the shared 2025-01-01 through 2025-03-31 horizon. Vehicles are
+stratified by `region × battery_type × first_positive_timing_band` where
+timing is by first positive-risk row (`no_eol`, `early_positive_window`,
+`mid_positive_window`, `late_positive_window`, `after_primary_horizon`). This
+split is now **frozen** for future evaluation and must not be re-allocated based
+on model performance.
 
-The selected primary result is ROC-AUC 0.865 and PR-AUC 0.166 against 4.11%
-test prevalence. Its recall-first threshold (`0.354`) reaches 99.9% recall but
-only 8.0% precision, producing many false positives. Random forest and XGBoost
-show severe train/validation overfitting gaps, with near-perfect train PR-AUC
-but validation PR-AUC around 0.13–0.16.
+Train/validation/test prevalence are 8.09%, 7.49%, and 7.79%, respectively.
+Logistic regression was selected by validation PR-AUC (0.134), ahead of all
+candidates.
+
+The selected primary result is ROC-AUC 0.790 and PR-AUC 0.234 against 7.79%
+test prevalence. The default operational threshold is fixed at `0.50`: on
+validation it gives 13.5% precision, 55.4% recall, and a 30.7% alert rate; on
+the untouched test set it gives 17.3% precision, 73.9% recall, and a 33.3%
+alert rate (confusion matrix `[[26987, 11509], [850, 2402]]`). The former
+recall-first threshold (`0.268`) remains an optional diagnostic only (80.0%
+validation recall, 10.2% precision, 58.7% alert rate) and is not the alert
+policy. Random forest and XGBoost show severe train/validation overfitting
+gaps, with near-perfect train PR-AUC but validation PR-AUC at or below 0.092.
+
+Post-split distribution audit is mostly comparable for key features, with minor
+imbalances at the vehicle level. The largest notable imbalance is battery age:
+validation vehicles are younger on average than test vehicles. This was retained as
+an accepted limitation because battery age has weak association with the target
+and the remaining imbalance is consistent with small-sample stratum allocation
+noise rather than a proven distributional flaw.
 
 The temporal stress test is diagnostic only: ROC-AUC collapses to 0.497 under
-the fixed chronological windows. The synthetic seasonal/temporal feature shift
+the fixed chronological windows. At the fixed 0.50 threshold it produces
+17.9% precision, 84.8% recall, and a 90.7% alert rate on stress-test data.
+The synthetic seasonal/temporal feature shift
 and changing label prevalence make this a robustness limitation, not a
 model-selection result. Do not add Airflow, PostgreSQL, Tableau, or MLOps in
 this milestone.

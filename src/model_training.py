@@ -1,7 +1,9 @@
 """Compare local battery-failure classifiers without changing the Spark feature job."""
 
 import argparse
+import hashlib
 import json
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +15,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, confusion_matrix, precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
@@ -21,6 +22,7 @@ DEFAULT_FEATURE_PATH = Path("data/processed/spark_batch_features")
 DEFAULT_REPORT_PATH = Path("data/processed/primary_model_comparison_metrics.json")
 DEFAULT_TEMPORAL_REPORT_PATH = Path("data/processed/temporal_stress_metrics.json")
 TARGET = "failure_within_30_operating_days"
+DEFAULT_THRESHOLD = 0.50
 IDENTIFIER_COLUMNS = ("event_id", "vehicle_id", "timestamp", TARGET, "vehicle_battery_type", "vehicle_region")
 NUMERIC_COLUMNS = (
     "battery_age_days",
@@ -46,6 +48,11 @@ TEMPORAL_BOUNDARIES = {
 }
 MIN_CLASS_VEHICLES = 2
 MIN_CLASS_ROWS = 2
+SPLIT_NAMES = ("train", "validation", "test")
+SPLIT_RATIOS = {"train": 0.60, "validation": 0.20, "test": 0.20}
+TIMING_BANDS = ("no_eol", "early_positive_window", "mid_positive_window", "late_positive_window", "after_primary_horizon")
+EARLY_POSITIVE_END = datetime(2025, 2, 14, 23, 59, 59)
+MID_POSITIVE_END = datetime(2025, 3, 14, 23, 59, 59)
 
 
 @dataclass
@@ -81,33 +88,77 @@ def load_rows(feature_path):
     return ds.dataset(str(feature_path), format="parquet", partitioning="hive").to_table(columns=list(dict.fromkeys(columns))).to_pylist()
 
 
-def _vehicle_cohorts(rows, seed=42):
-    vehicles = {}
-    for row in rows:
-        vehicle = vehicles.setdefault(
-            row["vehicle_id"],
-            {"has_positive": False, "battery_type": row["battery_type"], "region": row["region"]},
-        )
-        vehicle["has_positive"] |= bool(row[TARGET])
+def vehicle_timing_band(vehicle_rows):
+    """Classify a vehicle by the first observed 30-day positive-risk label."""
+    positives = [row["timestamp"] for row in vehicle_rows if row[TARGET]]
+    if not positives:
+        return "no_eol"
+    first_positive = min(positives)
+    if first_positive <= EARLY_POSITIVE_END:
+        return "early_positive_window"
+    if first_positive <= MID_POSITIVE_END:
+        return "mid_positive_window"
+    if first_positive <= PRIMARY_END:
+        return "late_positive_window"
+    return "after_primary_horizon"
 
-    vehicle_ids = sorted(vehicles)
-    strata = [
-        f"{vehicles[vehicle_id]['has_positive']}|{vehicles[vehicle_id]['battery_type']}|{vehicles[vehicle_id]['region']}"
-        for vehicle_id in vehicle_ids
-    ]
-    train_validation_index, test_index = next(
-        StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=seed).split(vehicle_ids, strata)
-    )
-    train_validation_ids = [vehicle_ids[index] for index in train_validation_index]
-    train_validation_strata = [strata[index] for index in train_validation_index]
-    train_index, validation_index = next(
-        StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=seed).split(train_validation_ids, train_validation_strata)
-    )
+
+def _vehicle_split_table(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["vehicle_id"]].append(row)
     return {
-        "train": {train_validation_ids[index] for index in train_index},
-        "validation": {train_validation_ids[index] for index in validation_index},
-        "test": {vehicle_ids[index] for index in test_index},
+        vehicle_id: {
+            "vehicle_id": vehicle_id,
+            "region": vehicle_rows[0]["region"],
+            "battery_type": vehicle_rows[0]["battery_type"],
+            "timing_band": vehicle_timing_band(vehicle_rows),
+        }
+        for vehicle_id, vehicle_rows in grouped.items()
     }
+
+
+def _cohort_sizes(total):
+    raw_sizes = {name: total * SPLIT_RATIOS[name] for name in SPLIT_NAMES}
+    sizes = {name: int(raw_sizes[name]) for name in SPLIT_NAMES}
+    for name in sorted(SPLIT_NAMES, key=lambda item: (-(raw_sizes[item] - sizes[item]), SPLIT_NAMES.index(item)))[: total - sum(sizes.values())]:
+        sizes[name] += 1
+    return sizes
+
+
+def _vehicle_cohorts(rows, seed=42):
+    """Allocate exact cohort sizes while keeping categorical timing quotas close."""
+    vehicles = _vehicle_split_table(rows)
+    attributes = ("region", "battery_type", "timing_band", "stratum")
+    weights = {"region": 2, "battery_type": 2, "timing_band": 4, "stratum": 1}
+    for vehicle in vehicles.values():
+        vehicle["stratum"] = (vehicle["region"], vehicle["battery_type"], vehicle["timing_band"])
+    totals = {attribute: Counter(vehicle[attribute] for vehicle in vehicles.values()) for attribute in attributes}
+    counts = {name: {attribute: Counter() for attribute in attributes} for name in SPLIT_NAMES}
+    sizes = _cohort_sizes(len(vehicles))
+    assigned = {name: set() for name in SPLIT_NAMES}
+
+    def stable_order(item):
+        vehicle_id, vehicle = item
+        return (totals["stratum"][vehicle["stratum"]], hashlib.sha256(f"{seed}:{vehicle_id}".encode()).hexdigest(), vehicle_id)
+
+    for vehicle_id, vehicle in sorted(vehicles.items(), key=stable_order):
+        candidates = [name for name in SPLIT_NAMES if len(assigned[name]) < sizes[name]]
+
+        def quota_error(name):
+            error = 0.0
+            for attribute in attributes:
+                value = vehicle[attribute]
+                target = totals[attribute][value] * SPLIT_RATIOS[name]
+                current = counts[name][attribute][value]
+                error += weights[attribute] * (((current + 1 - target) ** 2 - (current - target) ** 2) / max(target, 1))
+            return error
+
+        split = min(candidates, key=lambda name: (quota_error(name), SPLIT_NAMES.index(name)))
+        assigned[split].add(vehicle_id)
+        for attribute in attributes:
+            counts[split][attribute][vehicle[attribute]] += 1
+    return assigned
 
 
 def _validate_class_coverage(splits, min_class_vehicles, min_class_rows):
@@ -172,6 +223,7 @@ def _metrics(labels, probabilities, threshold):
         "pr_auc": float(average_precision_score(labels, probabilities)),
         "precision": float(precision_score(labels, predictions, zero_division=0)),
         "recall": float(recall_score(labels, predictions, zero_division=0)),
+        "alert_rate": float(predictions.mean()),
         "confusion_matrix": confusion_matrix(labels, predictions, labels=[0, 1]).tolist(),
     }
 
@@ -222,6 +274,54 @@ def split_summary(splits):
     return summary
 
 
+def _mean_median(values):
+    values = [value for value in values if value is not None and not np.isnan(value)]
+    return {"mean": float(np.mean(values)), "median": float(np.median(values))} if values else {"mean": None, "median": None}
+
+
+def _primary_cohort_balance(rows, cohorts):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["vehicle_id"]].append(row)
+    vehicles = _vehicle_split_table(rows)
+    primary_rows = {
+        vehicle_id: [row for row in vehicle_rows if PRIMARY_START <= row["timestamp"] <= PRIMARY_END]
+        for vehicle_id, vehicle_rows in grouped.items()
+    }
+    report = {}
+    for name, vehicle_ids in cohorts.items():
+        vehicle_ids = sorted(vehicle_ids)
+        cohort_vehicles = [vehicles[vehicle_id] for vehicle_id in vehicle_ids]
+        vehicle_rows = [primary_rows[vehicle_id] for vehicle_id in vehicle_ids]
+        first_positive_dates = []
+        vehicle_positive_rates = []
+        secondary = defaultdict(list)
+        for vehicle_id, rows_for_vehicle in zip(vehicle_ids, vehicle_rows):
+            all_rows = grouped[vehicle_id]
+            positives = [row["timestamp"] for row in all_rows if row[TARGET]]
+            first_positive_dates.append(min(positives).date().isoformat() if positives else "none")
+            vehicle_positive_rates.append(sum(row[TARGET] for row in rows_for_vehicle) / len(rows_for_vehicle))
+            initial = min(all_rows, key=lambda row: row["timestamp"])
+            secondary["initial_battery_age_days"].append(initial.get("battery_age_days"))
+            secondary["initial_odometer"].append(initial.get("odometer"))
+            for label, column in (("average_soc", "soc"), ("average_pack_voltage", "pack_voltage"), ("average_outside_temp", "outside_temp")):
+                secondary[label].append(np.mean([row[column] for row in rows_for_vehicle if row[column] is not None]))
+            secondary["average_module_temp"].append(
+                np.mean([(row["module_temp_min"] + row["module_temp_max"]) / 2 for row in rows_for_vehicle if row["module_temp_min"] is not None and row["module_temp_max"] is not None])
+            )
+        report[name] = {
+            "region": dict(sorted(Counter(vehicle["region"] for vehicle in cohort_vehicles).items())),
+            "battery_type": dict(sorted(Counter(vehicle["battery_type"] for vehicle in cohort_vehicles).items())),
+            "timing_band": dict(sorted(Counter(vehicle["timing_band"] for vehicle in cohort_vehicles).items())),
+            "ever_eol": {"yes": sum(date != "none" for date in first_positive_dates), "no": sum(date == "none" for date in first_positive_dates)},
+            "row_positive_rate": sum(row[TARGET] for rows_for_vehicle in vehicle_rows for row in rows_for_vehicle) / sum(len(rows_for_vehicle) for rows_for_vehicle in vehicle_rows),
+            "vehicle_positive_rate": _mean_median(vehicle_positive_rates),
+            "first_positive_date": dict(sorted(Counter(first_positive_dates).items())),
+            "secondary_balance_checks": {label: _mean_median(values) for label, values in secondary.items()},
+        }
+    return report
+
+
 def _feature_shift(splits):
     return {
         "numeric_median": {
@@ -255,7 +355,8 @@ def _fit_candidate(name, train, validation):
     model.fit(train_features, train_labels, **fit_args)
     train_probabilities = model.predict_proba(train_features)[:, 1]
     validation_probabilities = model.predict_proba(validation_features)[:, 1]
-    threshold = choose_recall_threshold(validation_labels, validation_probabilities)
+    threshold = DEFAULT_THRESHOLD
+    recall_first_threshold = choose_recall_threshold(validation_labels, validation_probabilities)
     train_metrics = _metrics(train_labels, train_probabilities, threshold)
     validation_metrics = _metrics(validation_labels, validation_probabilities, threshold)
     return {
@@ -265,6 +366,10 @@ def _fit_candidate(name, train, validation):
         "threshold": threshold,
         "train": train_metrics,
         "validation": validation_metrics,
+        "recall_first_diagnostic": {
+            "threshold": recall_first_threshold,
+            "validation": _metrics(validation_labels, validation_probabilities, recall_first_threshold),
+        },
         "generalization_gap": {metric: train_metrics[metric] - validation_metrics[metric] for metric in ("roc_auc", "pr_auc", "precision", "recall")},
     }
 
@@ -288,7 +393,11 @@ def run_primary_comparison(rows):
     return {
         "split_strategy": "vehicle_disjoint_common_horizon",
         "horizon": {"start": PRIMARY_START.isoformat(), "end": PRIMARY_END.isoformat()},
+        "stratification": "region_x_battery_type_x_first_positive_timing_band",
+        "split_seed": 42,
+        "threshold_policy": "fixed_probability_0.50",
         "splits": split_summary(splits),
+        "cohort_balance": _primary_cohort_balance(rows, _vehicle_cohorts(rows)),
         "selected_model": selected["name"],
         "threshold": selected["threshold"],
         "models": [_public_result(result) for result in results],
@@ -303,6 +412,7 @@ def run_temporal_stress(rows, selected_name):
     return {
         "split_strategy": "temporal_overlap_stress_test",
         "boundaries": {key: value.isoformat() for key, value in TEMPORAL_BOUNDARIES.items()},
+        "threshold_policy": "fixed_probability_0.50",
         "splits": split_summary(splits),
         "selected_model": selected_name,
         "threshold": result["threshold"],
