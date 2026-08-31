@@ -21,11 +21,13 @@ def test_fleet_batch_pipeline_has_the_expected_linear_batch_tasks():
         "parse_nasa_cycles",
         "simulate_fleet",
         "build_spark_features",
+        "load_postgres_batch",
     }
     assert dag.get_task("download_nasa_data").downstream_task_ids == {"parse_nasa_cycles"}
     assert dag.get_task("parse_nasa_cycles").downstream_task_ids == {"simulate_fleet"}
     assert dag.get_task("simulate_fleet").downstream_task_ids == {"build_spark_features"}
-    assert not dag.get_task("build_spark_features").downstream_task_ids
+    assert dag.get_task("build_spark_features").downstream_task_ids == {"load_postgres_batch"}
+    assert not dag.get_task("load_postgres_batch").downstream_task_ids
 
 
 def test_fleet_batch_pipeline_uses_the_defined_retry_and_spark_submission_policy():
@@ -33,6 +35,7 @@ def test_fleet_batch_pipeline_uses_the_defined_retry_and_spark_submission_policy
 
     download = dag.get_task("download_nasa_data")
     spark = dag.get_task("build_spark_features")
+    postgres_load = dag.get_task("load_postgres_batch")
 
     assert download.retries == 2
     assert spark.retries == 1
@@ -40,3 +43,6 @@ def test_fleet_batch_pipeline_uses_the_defined_retry_and_spark_submission_policy
     assert spark.retry_exponential_backoff is True
     assert "spark://spark-master:7077" in spark.bash_command
     assert "/opt/spark/bin/spark-submit" in spark.bash_command
+    assert postgres_load.retries == 1
+    assert "org.postgresql:postgresql:42.7.7" in postgres_load.bash_command
+    assert "--dataset vehicle_features" in postgres_load.bash_command

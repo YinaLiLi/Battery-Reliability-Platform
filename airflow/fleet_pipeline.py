@@ -45,5 +45,15 @@ with DAG(
         ),
         retries=1,
     )
+    load_postgres_batch = BashOperator(
+        task_id="load_postgres_batch",
+        bash_command=(
+            "cd /opt/project && exec /opt/spark/bin/spark-submit "
+            "--master spark://spark-master:7077 "
+            "--packages org.postgresql:postgresql:42.7.7 "
+            "src/postgres_loader.py --dataset vehicle_features"
+        ),
+        retries=1,
+    )
 
-    download_nasa_data >> parse_nasa_cycles >> simulate_fleet >> build_spark_features
+    download_nasa_data >> parse_nasa_cycles >> simulate_fleet >> build_spark_features >> load_postgres_batch

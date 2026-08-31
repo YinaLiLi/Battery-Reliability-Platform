@@ -105,6 +105,31 @@ Streaming remain independently run services and are intentionally outside this
 DAG. Model comparison also remains manual so its frozen evaluation reports are
 not casually regenerated.
 
+## PostgreSQL analytics output
+
+Copy `.env.example` to `.env`, choose a local PostgreSQL password, then start
+PostgreSQL and the Spark cluster:
+
+```sh
+docker compose up -d postgres postgres-init spark-master spark-worker-1 spark-worker-2
+docker compose run --rm spark-postgres-load
+```
+
+The loader explicitly truncates `analytics.vehicle_features` and appends the
+complete finalized `spark_batch_features` Parquet snapshot, preserving the
+pre-created PostgreSQL table, primary key, indexes, and constraints. The batch
+Airflow DAG runs the same load after feature generation. To load a completed
+streaming snapshot instead, run:
+
+```sh
+docker compose run --rm spark-postgres-load /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 --packages org.postgresql:postgresql:42.7.7 \
+  /opt/project/src/postgres_loader.py --dataset vehicle_window_metrics
+```
+
+Parquet remains the canonical source for both datasets and the streaming
+checkpoint remains responsible for Kafka recovery.
+
 ## Kafka → PySpark Structured Streaming
 
 Start Kafka and the existing Spark cluster, publish telemetry, then run the
