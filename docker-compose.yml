@@ -105,3 +105,25 @@ services:
         condition: service_started
       spark-worker-2:
         condition: service_started
+
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: ev-fleet-airflow:3.3.1
+    working_dir: /opt/project
+    volumes:
+      - ./:/opt/project
+      - airflow_data:/opt/airflow
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/project/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    command: ["airflow", "standalone"]
+    ports:
+      - "8083:8080"
+
+volumes:
+  airflow_data:
