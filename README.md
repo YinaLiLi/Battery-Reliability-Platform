@@ -80,3 +80,26 @@ submit-container environment) to observe:
 This is a batch-only milestone. Kafka Structured Streaming comes after these
 plans and data movements are familiar; its event-time windows are not a direct
 replacement for the row-based `lag` window used here.
+
+## Kafka → PySpark Structured Streaming
+
+Start Kafka and the existing Spark cluster, publish telemetry, then run the
+bounded streaming job:
+
+```sh
+docker compose up -d kafka spark-master spark-worker-1 spark-worker-2
+.venv/bin/python src/kafka_producer.py --limit 300
+docker compose run --rm spark-stream-submit
+docker compose run --rm spark-submit /opt/spark/bin/spark-sql --master spark://spark-master:7077 -e 'SELECT * FROM parquet.`data/processed/spark_streaming_windows` LIMIT 20'
+```
+
+The query reads `vehicle_telemetry` in 100-record micro-batches, parses the
+JSON schema, treats simulator timestamps as UTC event time, and writes
+six-hour per-vehicle Parquet windows. It uses a two-hour event-time watermark
+and `event_id` deduplication before aggregation, so repeated producer sends do
+not increase `event_count` while their event times are within the watermark.
+
+The checkpoint at `data/processed/spark_streaming_checkpoint/` owns Kafka
+offset recovery and sink commits. Re-run the same command to resume without
+replaying committed offsets. To intentionally replay from earliest offsets,
+remove both that checkpoint and `data/processed/spark_streaming_windows/`.

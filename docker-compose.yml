@@ -85,3 +85,23 @@ services:
       - spark-master
       - spark-worker-1
       - spark-worker-2
+
+  spark-stream-submit:
+    image: ev-fleet-spark:4.1.3
+    working_dir: /opt/project
+    volumes:
+      - ./:/opt/project
+    command: >-
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3
+      /opt/project/src/spark_streaming.py --available-now
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
