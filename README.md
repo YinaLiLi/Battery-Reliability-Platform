@@ -45,3 +45,38 @@ After generating `data/processed/synthetic_fleet_telemetry.parquet`, install the
 ```
 
 The producer uses `vehicle_id` as the Kafka key, so all events for a vehicle go to the same partition and retain their order. The consumer prints a partition and offset for every event, then commits that offset only after printing succeeds. Use `--limit 0` or `--max-messages 0` to process the complete stream.
+
+## PySpark batch foundations
+
+Build the Spark 4.1.3 image, start a small standalone cluster, then submit the batch feature job:
+
+```sh
+docker compose build spark-master
+docker compose up -d spark-master spark-worker-1 spark-worker-2
+docker compose run --rm spark-submit
+docker compose run --rm -e SPARK_TEST_MASTER=spark://spark-master:7077 spark-submit python3 -m pytest -q
+```
+
+The image uses Apache Spark/PySpark 4.1.3 with its bundled Java 17 runtime, so
+the host `JAVA_HOME` is not used. It runs one master and two one-core workers;
+the repository is mounted at `/opt/project` in all Spark containers. The job
+writes labeled features to `data/processed/spark_batch_features/`.
+
+Its `spark.sql.shuffle.partitions=3` setting keeps plans small enough to
+inspect. It is independent of the Kafka topic's three partitions: shuffle
+partitions are Spark query tasks, while Kafka partitions are broker log shards.
+Open the master UI at `http://localhost:8080` and worker UIs at
+`http://localhost:8081` and `http://localhost:8082` while a job is running.
+
+Use the job output and `notebooks/03_pyspark_batch.ipynb` (from the mounted
+submit-container environment) to observe:
+
+- lazy transformations becoming work at `count`, `show`, and `write` actions;
+- repartitioning and the shuffle created by the label join;
+- cache reuse for the telemetry branch used by both features and vehicle metadata;
+- the explicit broadcast join of the real `vehicle_id` / `battery_type` / `region` dimension;
+- vehicle history windows and a deliberately skewed `is_charging` repartition.
+
+This is a batch-only milestone. Kafka Structured Streaming comes after these
+plans and data movements are familiar; its event-time windows are not a direct
+replacement for the row-based `lag` window used here.
