@@ -103,3 +103,47 @@ The checkpoint at `data/processed/spark_streaming_checkpoint/` owns Kafka
 offset recovery and sink commits. Re-run the same command to resume without
 replaying committed offsets. To intentionally replay from earliest offsets,
 remove both that checkpoint and `data/processed/spark_streaming_windows/`.
+
+## Battery failure model comparison
+
+Run the local model comparison after generating the PySpark feature dataset:
+
+```sh
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python src/model_training.py
+```
+
+The script makes vehicle-disjoint train/validation/test cohorts over the shared
+calendar horizon, compares logistic regression, random forest, and XGBoost, and
+writes the frozen primary evaluation to
+`data/processed/primary_model_comparison_metrics.json`. It separately writes a
+time-only stress test for the primary-selected configuration to
+`data/processed/temporal_stress_metrics.json`; that stress result cannot change
+the selected model. On macOS with a nonstandard Homebrew prefix, install `libomp`
+and launch it with:
+
+```sh
+brew install libomp
+DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix libomp)/lib" .venv/bin/python src/model_training.py
+```
+
+### Verified ML milestone
+
+The primary task is predicting `failure_within_30_operating_days` for unseen
+vehicles. The authoritative benchmark uses exact 60/20/20 vehicle-disjoint
+cohorts over the shared 2025-01-01 through 2025-03-31 horizon. Logistic
+regression was selected by the predefined validation PR-AUC rule with the
+simplicity tie-breaker: XGBoost depth 5 reached PR-AUC 0.165 and logistic
+regression 0.162, within the 0.005 tolerance.
+
+The selected primary result is ROC-AUC 0.865 and PR-AUC 0.166 against 4.11%
+test prevalence. Its recall-first threshold (`0.354`) reaches 99.9% recall but
+only 8.0% precision, producing many false positives. Random forest and XGBoost
+show severe train/validation overfitting gaps, with near-perfect train PR-AUC
+but validation PR-AUC around 0.13–0.16.
+
+The temporal stress test is diagnostic only: ROC-AUC collapses to 0.497 under
+the fixed chronological windows. The synthetic seasonal/temporal feature shift
+and changing label prevalence make this a robustness limitation, not a
+model-selection result. Do not add Airflow, PostgreSQL, Tableau, or MLOps in
+this milestone.
