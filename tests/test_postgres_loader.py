@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from src.postgres_loader import assert_group_totals_match, prepare_battery_cycle_health, prepare_replay_windows
+from src.postgres_loader import assert_group_totals_match, prepare_battery_cycle_health, prepare_evaluations, prepare_predictions, prepare_replay_windows, validate_snapshot
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +34,27 @@ def test_prepare_replay_windows_uses_cycle_natural_key(spark):
     )
     row = prepare_replay_windows(source).first()
     assert (row.battery_id, row.cycle_index, row.event_count) == ("MATR-1", 1, 2)
+
+
+def test_prepare_evaluations_defaults_missing_training_metadata_for_existing_artifacts(spark):
+    source = spark.createDataFrame(
+        [("candidate-1", "xgboost", "MATR", "candidate", "2026-09-01T00:00:00Z", "{}")],
+        "model_version string, model_name string, dataset string, status string, evaluated_at string, metrics_json string",
+    )
+
+    row = prepare_evaluations(source).first()
+
+    assert row.training_metadata == "{}"
+
+
+def test_prediction_validation_rejects_negative_served_rul(spark):
+    source = spark.createDataFrame(
+        [("model-1", "MATR", "MATR-1", 1, -3.0, "2026-09-01T00:00:00Z", "test")],
+        "model_version string, dataset string, battery_id string, cycle_index int, predicted_rul_cycles double, prediction_created_at string, split string",
+    )
+
+    with pytest.raises(ValueError, match="negative served RUL"):
+        validate_snapshot(prepare_predictions(source), "battery_predictions")
 
 
 def test_group_total_validation_rejects_a_mismatched_database_snapshot(spark):

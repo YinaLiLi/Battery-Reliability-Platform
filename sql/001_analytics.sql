@@ -12,10 +12,25 @@ CREATE INDEX IF NOT EXISTS battery_cycle_health_battery_cycle_idx ON analytics.b
 
 CREATE TABLE IF NOT EXISTS analytics.battery_predictions (
     model_version TEXT NOT NULL, dataset TEXT NOT NULL, battery_id TEXT NOT NULL, cycle_index INTEGER NOT NULL CHECK (cycle_index > 0),
-    predicted_rul_cycles DOUBLE PRECISION NOT NULL, prediction_created_at TIMESTAMPTZ NOT NULL, split TEXT NOT NULL,
+    raw_predicted_rul_cycles DOUBLE PRECISION, predicted_rul_cycles DOUBLE PRECISION NOT NULL CHECK (predicted_rul_cycles >= 0), prediction_created_at TIMESTAMPTZ NOT NULL, split TEXT NOT NULL,
     PRIMARY KEY (model_version, dataset, battery_id, cycle_index)
 );
 CREATE INDEX IF NOT EXISTS battery_predictions_battery_cycle_idx ON analytics.battery_predictions (battery_id, cycle_index);
+
+ALTER TABLE analytics.battery_predictions
+    ADD COLUMN IF NOT EXISTS raw_predicted_rul_cycles DOUBLE PRECISION;
+UPDATE analytics.battery_predictions
+SET raw_predicted_rul_cycles = predicted_rul_cycles
+WHERE raw_predicted_rul_cycles IS NULL;
+UPDATE analytics.battery_predictions
+SET predicted_rul_cycles = GREATEST(0, predicted_rul_cycles)
+WHERE predicted_rul_cycles < 0;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'battery_predictions_nonnegative_rul') THEN
+        ALTER TABLE analytics.battery_predictions
+            ADD CONSTRAINT battery_predictions_nonnegative_rul CHECK (predicted_rul_cycles >= 0);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS analytics.battery_replay_windows (
     battery_id TEXT NOT NULL, cycle_index INTEGER NOT NULL CHECK (cycle_index > 0), event_count BIGINT NOT NULL CHECK (event_count > 0),
@@ -26,6 +41,49 @@ CREATE TABLE IF NOT EXISTS analytics.battery_replay_windows (
 
 CREATE TABLE IF NOT EXISTS analytics.model_evaluations (
     model_version TEXT PRIMARY KEY, model_name TEXT NOT NULL, dataset TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('candidate', 'champion')),
-    evaluated_at TIMESTAMPTZ NOT NULL, metrics JSONB NOT NULL
+    evaluated_at TIMESTAMPTZ NOT NULL, metrics JSONB NOT NULL,
+    training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 CREATE INDEX IF NOT EXISTS model_evaluations_status_idx ON analytics.model_evaluations (status, evaluated_at DESC);
+
+ALTER TABLE analytics.model_evaluations
+    ADD COLUMN IF NOT EXISTS training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS battery_cycle_health_latest_idx
+    ON analytics.battery_cycle_health (dataset, battery_id, cycle_index DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS model_evaluations_one_champion_per_dataset_idx
+    ON analytics.model_evaluations (dataset) WHERE status = 'champion';
+
+CREATE OR REPLACE VIEW analytics.dashboard_battery_latest AS
+WITH latest_health AS (
+    SELECT DISTINCT ON (dataset, battery_id)
+        dataset, battery_id, cycle_index, soh, discharge_capacity_in_ah,
+        internal_resistance_in_ohm, temperature_max_in_c, capacity_slope_10
+    FROM analytics.battery_cycle_health
+    ORDER BY dataset, battery_id, cycle_index DESC
+), champion AS (
+    SELECT dataset, model_version
+    FROM analytics.model_evaluations
+    WHERE status = 'champion'
+)
+SELECT
+    health.dataset,
+    health.battery_id,
+    health.cycle_index AS current_cycle,
+    health.soh AS measured_soh,
+    health.discharge_capacity_in_ah AS measured_capacity_in_ah,
+    health.internal_resistance_in_ohm,
+    health.temperature_max_in_c,
+    health.capacity_slope_10,
+    champion.model_version AS champion_model_version,
+    prediction.predicted_rul_cycles AS predicted_rul_cycles,
+    prediction.prediction_created_at,
+    health.cycle_index + prediction.predicted_rul_cycles AS estimated_eol_cycle
+FROM latest_health AS health
+LEFT JOIN champion ON champion.dataset = health.dataset
+LEFT JOIN analytics.battery_predictions AS prediction
+    ON prediction.model_version = champion.model_version
+    AND prediction.dataset = health.dataset
+    AND prediction.battery_id = health.battery_id
+    AND prediction.cycle_index = health.cycle_index;

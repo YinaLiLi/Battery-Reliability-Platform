@@ -24,10 +24,12 @@ def prepare_replay_windows(frame):
     return frame.select("battery_id", "cycle_index", "event_count", "average_voltage_in_V", "maximum_temperature_in_C", "charge_capacity_in_Ah", "discharge_capacity_in_Ah", "internal_resistance_in_ohm")
 
 def prepare_predictions(frame):
-    return frame.select("model_version", "dataset", "battery_id", "cycle_index", "predicted_rul_cycles", F.to_timestamp("prediction_created_at").alias("prediction_created_at"), "split")
+    raw = F.col("raw_predicted_rul_cycles") if "raw_predicted_rul_cycles" in frame.columns else F.col("predicted_rul_cycles")
+    return frame.select("model_version", "dataset", "battery_id", "cycle_index", raw.alias("raw_predicted_rul_cycles"), "predicted_rul_cycles", F.to_timestamp("prediction_created_at").alias("prediction_created_at"), "split")
 
 def prepare_evaluations(frame):
-    return frame.select("model_version", "model_name", "dataset", "status", F.to_timestamp("evaluated_at").alias("evaluated_at"), F.col("metrics_json").alias("metrics"))
+    metadata = F.col("training_metadata_json") if "training_metadata_json" in frame.columns else F.lit("{}")
+    return frame.select("model_version", "model_name", "dataset", "status", F.to_timestamp("evaluated_at").alias("evaluated_at"), F.col("metrics_json").alias("metrics"), metadata.alias("training_metadata"))
 
 PREPARERS = {"battery_cycle_health": prepare_battery_cycle_health, "battery_replay_windows": prepare_replay_windows, "battery_predictions": prepare_predictions, "model_evaluations": prepare_evaluations}
 
@@ -36,6 +38,7 @@ def validate_snapshot(frame, dataset):
     if frame.where(F.expr(" OR ".join(f"{key} IS NULL" for key in keys))).limit(1).count() or frame.groupBy(*keys).count().where("count > 1").limit(1).count():
         raise ValueError(f"{dataset} has null or duplicate natural keys")
     if dataset == "battery_cycle_health" and frame.where((F.col("cycle_index") <= 0) | (F.col("soh") < 0)).limit(1).count(): raise ValueError("battery_cycle_health has invalid values")
+    if dataset == "battery_predictions" and frame.where(F.col("predicted_rul_cycles") < 0).limit(1).count(): raise ValueError("battery_predictions has negative served RUL")
     if dataset == "battery_replay_windows" and frame.where(F.col("event_count") <= 0).limit(1).count(): raise ValueError("battery_replay_windows has invalid values")
 
 def _execute(spark, jdbc_url, user, password, sql):

@@ -25,7 +25,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-battery_reliability}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    command: ["sh", "-c", "psql -v ON_ERROR_STOP=1 -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/001_analytics.sql -f /sql/002_drop_legacy_ev.sql"]
+      DASHBOARD_POSTGRES_PASSWORD: ${DASHBOARD_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}
+    command: ["sh", "-c", "psql -v ON_ERROR_STOP=1 -v dashboard_password=\"$$DASHBOARD_POSTGRES_PASSWORD\" -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/001_analytics.sql -f /sql/002_drop_legacy_ev.sql -f /sql/003_dashboard_role.sql"]
     volumes:
       - ./sql:/sql:ro
 
@@ -186,6 +187,18 @@ services:
         condition: service_completed_successfully
       spark-master:
         condition: service_started
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://analytics_dashboard:${DASHBOARD_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}@postgres:5432/${POSTGRES_DB:-battery_reliability}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
 
 volumes:
   airflow_data:

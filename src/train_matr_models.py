@@ -14,8 +14,10 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 try:
     from .matr_stage2 import split_audit
+    from .rul_predictions import constrain_prediction_row
 except ImportError:
     from matr_stage2 import split_audit
+    from rul_predictions import constrain_prediction_row
 
 ROOT=Path('data/processed/matr')
 TARGET='rul_cycles'
@@ -40,15 +42,16 @@ def main():
     scores={}
     fitted={}
     for name,model in models.items():
-        model.fit(matrix[indexes['train']],labels[indexes['train']]); score={part:metrics(labels[indexes[part]],model.predict(matrix[indexes[part]])) for part in ('train','validation','test')}
+        model.fit(matrix[indexes['train']],labels[indexes['train']]); score={part:metrics(labels[indexes[part]],np.maximum(model.predict(matrix[indexes[part]]),0)) for part in ('train','validation','test')}
         score['generalization_gap']={k:score['validation'][k]-score['train'][k] for k in score['train']}
-        cycles=np.asarray(table['cycle_index']); eol=np.asarray(table['eol_cycle']); stages=np.select([cycles<eol*.33,cycles<eol*.67],['early','mid'],default='late'); test_stage=stages[indexes['test']]; pred=model.predict(matrix[indexes['test']])
+        cycles=np.asarray(table['cycle_index']); eol=np.asarray(table['eol_cycle']); stages=np.select([cycles<eol*.33,cycles<eol*.67],['early','mid'],default='late'); test_stage=stages[indexes['test']]; pred=np.maximum(model.predict(matrix[indexes['test']]),0)
         score['lifecycle_stage_mae']={stage:float(mean_absolute_error(labels[indexes['test']][test_stage==stage],pred[test_stage==stage])) for stage in ('early','mid','late')}; scores[name]=score; fitted[name]=model
     leakage={'target':TARGET,'predictors':RUL_FEATURES,'excluded_predictors':['eol_cycle','rul_cycles','lineage_group_id','battery_id'],'train_only_preprocessing':True,'battery_overlap':audit['battery_overlap'],'lineage_overlap':audit['lineage_overlap'],'soh_policy':'calculated directly as discharge_capacity_in_Ah / nominal_capacity_in_Ah / SOC_width; not ML-predicted'}
     (ROOT/'rul_model_metrics.json').write_text(json.dumps(scores,indent=2)); (ROOT/'lifecycle_stage_error_report.json').write_text(json.dumps({k:v['lifecycle_stage_mae'] for k,v in scores.items()},indent=2)); (ROOT/'leakage_generalization_audit.json').write_text(json.dumps({'split':audit,**leakage,'model_selection':'xgboost: best validation MAE/RMSE/R2'},indent=2))
-    predicted=fitted['xgboost'].predict(matrix)
-    rows=[{'model_version':model_version,'dataset':table['dataset'][i],'battery_id':table['battery_id'][i],'cycle_index':table['cycle_index'][i],'predicted_rul_cycles':float(predicted[i]),'prediction_created_at':evaluated_at,'split':next(name for name,ids in splits.items() if table['battery_id'][i] in ids)} for i in range(len(predicted))]
+    raw_predicted=fitted['xgboost'].predict(matrix)
+    rows=[constrain_prediction_row({'model_version':model_version,'dataset':table['dataset'][i],'battery_id':table['battery_id'][i],'cycle_index':table['cycle_index'][i],'predicted_rul_cycles':float(raw_predicted[i]),'prediction_created_at':evaluated_at,'split':next(name for name,ids in splits.items() if table['battery_id'][i] in ids)}) for i in range(len(raw_predicted))]
     pq.write_table(__import__('pyarrow').Table.from_pylist(rows),ROOT/'candidate_predictions.parquet')
-    evaluation={'model_version':model_version,'model_name':'xgboost_rul_regressor','dataset':'MATR','status':'candidate','evaluated_at':evaluated_at,'metrics_json':json.dumps({'train':scores['xgboost']['train'],'validation':scores['xgboost']['validation'],'test':scores['xgboost']['test'],'lifecycle_stage_mae':scores['xgboost']['lifecycle_stage_mae'],'generalization_gap':scores['xgboost']['generalization_gap']})}
+    training_metadata={'training_data_version':'MATR / degradation_features','lineage_manifest':'matr_provenance.parquet','training_row_count':int(indexes['train'].sum()),'validation_row_count':int(indexes['validation'].sum()),'test_row_count':int(indexes['test'].sum())}
+    evaluation={'model_version':model_version,'model_name':'xgboost_rul_regressor','dataset':'MATR','status':'candidate','evaluated_at':evaluated_at,'metrics_json':json.dumps({'train':scores['xgboost']['train'],'validation':scores['xgboost']['validation'],'test':scores['xgboost']['test'],'lifecycle_stage_mae':scores['xgboost']['lifecycle_stage_mae'],'generalization_gap':scores['xgboost']['generalization_gap']}),'training_metadata_json':json.dumps(training_metadata)}
     pq.write_table(__import__('pyarrow').Table.from_pylist([evaluation]),ROOT/'candidate_model_evaluation.parquet')
 if __name__=='__main__': main()
