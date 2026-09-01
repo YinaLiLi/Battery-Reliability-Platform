@@ -1,4 +1,4 @@
-"""Print synthetic fleet telemetry from Kafka with explicit offset commits."""
+"""Print battery measurements from Kafka with explicit offset commits."""
 
 import argparse
 import json
@@ -9,7 +9,7 @@ except ImportError:  # Lets unit tests run before the optional runtime dependenc
     Consumer = None
 
 
-TOPIC = "vehicle_telemetry"
+TOPIC = "battery_measurements"
 
 
 def consume_messages(consumer, max_messages=1000, output=print):
@@ -38,7 +38,7 @@ def consume_messages(consumer, max_messages=1000, output=print):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Print synthetic fleet telemetry from Kafka.")
+    parser = argparse.ArgumentParser(description="Print battery measurements from Kafka.")
     parser.add_argument("--bootstrap-server", default="localhost:9092")
     parser.add_argument("--max-messages", type=int, default=1000, help="Messages to print; 0 runs indefinitely.")
     return parser.parse_args()

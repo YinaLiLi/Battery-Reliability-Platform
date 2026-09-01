@@ -6,6 +6,10 @@ from src.kafka_consumer import consume_messages
 from src.kafka_producer import produce_rows
 
 
+def event(battery_id="MATR-1", event_id="one"):
+    return {"event_id": event_id, "dataset": "MATR", "battery_id": battery_id, "cycle_index": 1, "sample_index": 0, "replay_event_time": "2020-01-01T00:00:00+00:00"}
+
+
 class FakeProducer:
     def __init__(self, callback_error=None):
         self.callback_error = callback_error
@@ -60,7 +64,7 @@ def test_producer_limits_rows_and_flushes_after_asynchronous_delivery():
     producer = FakeProducer()
 
     sent = produce_rows(
-        [{"vehicle_id": "EV-0001", "event_id": "one"}, {"vehicle_id": "EV-0002", "event_id": "two"}],
+        [event(), event("MATR-2", "two")],
         producer,
         limit=1,
     )
@@ -68,21 +72,21 @@ def test_producer_limits_rows_and_flushes_after_asynchronous_delivery():
     assert sent == 1
     assert producer.flushed
     assert producer.poll_calls == 1
-    assert producer.produced[0]["key"] == b"EV-0001"
-    assert json.loads(producer.produced[0]["value"]) == {"vehicle_id": "EV-0001", "event_id": "one"}
+    assert producer.produced[0]["key"] == b"MATR-1"
+    assert json.loads(producer.produced[0]["value"])["schema_version"] == "1.0"
 
 
 def test_producer_raises_after_flush_when_delivery_fails():
     producer = FakeProducer(callback_error=RuntimeError("broker unavailable"))
 
     with pytest.raises(RuntimeError, match="delivery failed"):
-        produce_rows([{"vehicle_id": "EV-0001"}], producer, limit=0)
+        produce_rows([event()], producer, limit=0)
 
     assert producer.flushed
 
 
 def test_consumer_prints_then_commits_each_successful_message():
-    message = FakeMessage(json.dumps({"vehicle_id": "EV-0001"}).encode())
+    message = FakeMessage(json.dumps({"battery_id": "MATR-1"}).encode())
     consumer = FakeConsumer([message])
     printed = []
 
@@ -93,5 +97,5 @@ def test_consumer_prints_then_commits_each_successful_message():
     assert json.loads(printed[0]) == {
         "offset": 4,
         "partition": 1,
-        "value": {"vehicle_id": "EV-0001"},
+        "value": {"battery_id": "MATR-1"},
     }

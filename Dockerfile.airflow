@@ -1,4 +1,4 @@
-FROM ev-fleet-spark:4.1.3
+FROM battery-reliability-spark:4.1.3
 
 USER root
 

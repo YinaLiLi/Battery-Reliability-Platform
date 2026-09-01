@@ -1,48 +1,15 @@
 from pathlib import Path
 
-from airflow.models import DagBag
+import pytest
+
+DagBag = pytest.importorskip("airflow.models").DagBag
 
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_fleet_batch_pipeline_has_the_expected_linear_batch_tasks():
-    dag_bag = DagBag(dag_folder=str(ROOT / "airflow"))
-
-    assert not dag_bag.import_errors
-    dag = dag_bag.dags.get("fleet_batch_pipeline")
-
+def test_matr_pipeline_has_one_linear_retraining_path():
+    dag = DagBag(dag_folder=str(Path(__file__).resolve().parents[1] / "airflow")).dags.get("matr_reliability_pipeline")
     assert dag is not None
-    assert dag.schedule is None
-    assert dag.catchup is False
-    assert dag.max_active_runs == 1
-    assert set(dag.task_ids) == {
-        "download_nasa_data",
-        "parse_nasa_cycles",
-        "simulate_fleet",
-        "build_spark_features",
-        "load_postgres_batch",
-    }
-    assert dag.get_task("download_nasa_data").downstream_task_ids == {"parse_nasa_cycles"}
-    assert dag.get_task("parse_nasa_cycles").downstream_task_ids == {"simulate_fleet"}
-    assert dag.get_task("simulate_fleet").downstream_task_ids == {"build_spark_features"}
-    assert dag.get_task("build_spark_features").downstream_task_ids == {"load_postgres_batch"}
-    assert not dag.get_task("load_postgres_batch").downstream_task_ids
-
-
-def test_fleet_batch_pipeline_uses_the_defined_retry_and_spark_submission_policy():
-    dag = DagBag(dag_folder=str(ROOT / "airflow")).dags.get("fleet_batch_pipeline")
-
-    download = dag.get_task("download_nasa_data")
-    spark = dag.get_task("build_spark_features")
-    postgres_load = dag.get_task("load_postgres_batch")
-
-    assert download.retries == 2
-    assert spark.retries == 1
-    assert download.retry_exponential_backoff is True
-    assert spark.retry_exponential_backoff is True
-    assert "spark://spark-master:7077" in spark.bash_command
-    assert "/opt/spark/bin/spark-submit" in spark.bash_command
-    assert postgres_load.retries == 1
-    assert "org.postgresql:postgresql:42.7.7" in postgres_load.bash_command
-    assert "--dataset vehicle_features" in postgres_load.bash_command
+    assert list(dag.task_ids) == ["ingest_matr", "normalize_matr", "build_degradation_features", "train_evaluate_models", "publish_predictions", "load_serving_tables"]
+    assert dag.get_task("ingest_matr").downstream_task_ids == {"normalize_matr"}
+    assert dag.get_task("train_evaluate_models").downstream_task_ids == {"publish_predictions"}
+    assert dag.get_task("load_serving_tables").downstream_task_ids == set()
+    assert "exec /opt/spark/bin/spark-submit" not in dag.get_task("load_serving_tables").bash_command

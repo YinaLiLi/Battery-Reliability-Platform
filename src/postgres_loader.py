@@ -1,160 +1,80 @@
-"""Load finalized Spark Parquet snapshots into PostgreSQL analytics tables."""
-
+"""Load small finalized MATR serving snapshots into PostgreSQL; Parquet remains canonical."""
 import argparse
 import os
 from pathlib import Path
-
 from pyspark.sql import SparkSession, functions as F
 
-
 DEFAULT_MASTER = "spark://spark-master:7077"
-DEFAULT_JDBC_URL = "jdbc:postgresql://postgres:5432/ev_fleet"
-DEFAULT_FEATURE_PATH = Path("data/processed/spark_batch_features")
-DEFAULT_WINDOW_PATH = Path("data/processed/spark_streaming_windows")
-
+DEFAULT_JDBC_URL = "jdbc:postgresql://postgres:5432/battery_reliability"
+ROOT = Path("data/processed/matr")
 DATASETS = {
-    "vehicle_features": {
-        "path": DEFAULT_FEATURE_PATH,
-        "table": "analytics.vehicle_features",
-        "keys": ("event_id",),
-    },
-    "vehicle_window_metrics": {
-        "path": DEFAULT_WINDOW_PATH,
-        "table": "analytics.vehicle_window_metrics",
-        "keys": ("window_start", "window_end", "vehicle_id"),
-    },
+    "battery_cycle_health": {"path": ROOT / "degradation_features", "table": "analytics.battery_cycle_health", "keys": ("dataset", "battery_id", "cycle_index"), "snapshot": True},
+    "battery_replay_windows": {"path": ROOT / "replay_cycle_health", "table": "analytics.battery_replay_windows", "keys": ("battery_id", "cycle_index"), "snapshot": True},
+    "battery_predictions": {"path": ROOT / "published_predictions.parquet", "table": "analytics.battery_predictions", "keys": ("model_version", "dataset", "battery_id", "cycle_index"), "snapshot": False},
+    "model_evaluations": {"path": ROOT / "published_model_evaluation.parquet", "table": "analytics.model_evaluations", "keys": ("model_version",), "snapshot": False},
 }
 
-
 def build_spark_session(master=DEFAULT_MASTER):
-    """Create the Spark session used for snapshot loading."""
-    return (
-        SparkSession.builder.master(master)
-        .appName("ev-fleet-postgres-loader")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.cores.max", 2)
-        .config("spark.executor.cores", 1)
-        .config("spark.dynamicAllocation.enabled", "false")
-        .getOrCreate()
-    )
+    return SparkSession.builder.master(master).appName("matr-postgres-loader").config("spark.sql.session.timeZone", "UTC").config("spark.cores.max", 2).config("spark.executor.cores", 1).config("spark.dynamicAllocation.enabled", "false").getOrCreate()
 
+def prepare_battery_cycle_health(frame):
+    return frame.select("dataset", "battery_id", "cycle_index", "soh", "rul_cycles", "discharge_capacity_in_Ah", "internal_resistance_in_ohm", "temperature_max_in_C", "charge_time_in_s", "capacity_slope_10", "coulombic_efficiency")
 
-def prepare_vehicle_features(frame):
-    """Rename the batch timestamp to the persistent analytics column name."""
-    return frame.withColumnRenamed("timestamp", "event_time").withColumn(
-        "failure_within_30_operating_days", F.col("failure_within_30_operating_days").cast("short")
-    )
+def prepare_replay_windows(frame):
+    return frame.select("battery_id", "cycle_index", "event_count", "average_voltage_in_V", "maximum_temperature_in_C", "charge_capacity_in_Ah", "discharge_capacity_in_Ah", "internal_resistance_in_ohm")
 
+def prepare_predictions(frame):
+    return frame.select("model_version", "dataset", "battery_id", "cycle_index", "predicted_rul_cycles", F.to_timestamp("prediction_created_at").alias("prediction_created_at"), "split")
 
-def prepare_window_metrics(frame):
-    """Flatten Spark's window struct into the PostgreSQL primary-key columns."""
-    return frame.select(
-        F.col("window.start").alias("window_start"),
-        F.col("window.end").alias("window_end"),
-        "vehicle_id",
-        "event_count",
-        "average_pack_voltage",
-        "maximum_module_temperature",
-    )
+def prepare_evaluations(frame):
+    return frame.select("model_version", "model_name", "dataset", "status", F.to_timestamp("evaluated_at").alias("evaluated_at"), F.col("metrics_json").alias("metrics"))
 
+PREPARERS = {"battery_cycle_health": prepare_battery_cycle_health, "battery_replay_windows": prepare_replay_windows, "battery_predictions": prepare_predictions, "model_evaluations": prepare_evaluations}
 
 def validate_snapshot(frame, dataset):
-    """Fail before truncation if a finalized snapshot violates table invariants."""
     keys = DATASETS[dataset]["keys"]
-    if frame.where(F.expr(" OR ".join(f"{key} IS NULL" for key in keys))).limit(1).count():
-        raise ValueError(f"{dataset} contains a null primary-key value")
-    if frame.groupBy(*keys).count().where("count > 1").limit(1).count():
-        raise ValueError(f"{dataset} contains duplicate primary-key values")
-    if dataset == "vehicle_features":
-        invalid = frame.where(
-            ~F.col("failure_within_30_operating_days").isin(0, 1)
-            | (F.col("module_temp_min") > F.col("module_temp_max"))
-        )
-    else:
-        invalid = frame.where(
-            (F.col("event_count") <= 0) | (F.col("window_start") >= F.col("window_end"))
-        )
-    if invalid.limit(1).count():
-        raise ValueError(f"{dataset} contains invalid analytics values")
+    if frame.where(F.expr(" OR ".join(f"{key} IS NULL" for key in keys))).limit(1).count() or frame.groupBy(*keys).count().where("count > 1").limit(1).count():
+        raise ValueError(f"{dataset} has null or duplicate natural keys")
+    if dataset == "battery_cycle_health" and frame.where((F.col("cycle_index") <= 0) | (F.col("soh") < 0)).limit(1).count(): raise ValueError("battery_cycle_health has invalid values")
+    if dataset == "battery_replay_windows" and frame.where(F.col("event_count") <= 0).limit(1).count(): raise ValueError("battery_replay_windows has invalid values")
 
-
-def truncate_target(spark, jdbc_url, user, password, table):
-    """Explicitly truncate a pre-created table without allowing Spark to recreate it."""
-    jvm = spark.sparkContext._jvm
-    properties = jvm.java.util.Properties()
-    properties.setProperty("user", user)
-    properties.setProperty("password", password)
-    driver_class = jvm.org.apache.spark.util.Utils.getContextOrSparkClassLoader().loadClass("org.postgresql.Driver")
-    connection = driver_class.newInstance().connect(jdbc_url, properties)
+def _execute(spark, jdbc_url, user, password, sql):
+    props = spark.sparkContext._jvm.java.util.Properties(); props.setProperty("user", user); props.setProperty("password", password)
+    connection = spark.sparkContext._jvm.org.apache.spark.util.Utils.getContextOrSparkClassLoader().loadClass("org.postgresql.Driver").newInstance().connect(jdbc_url, props)
     try:
         statement = connection.createStatement()
-        try:
-            statement.executeUpdate(f"TRUNCATE TABLE {table}")
-        finally:
-            statement.close()
-    finally:
-        connection.close()
+        try: statement.executeUpdate(sql)
+        finally: statement.close()
+    finally: connection.close()
 
-
-def jdbc_properties(user, password):
-    return {"user": user, "password": password, "driver": "org.postgresql.Driver"}
-
+def jdbc_properties(user, password): return {"user": user, "password": password, "driver": "org.postgresql.Driver", "stringtype": "unspecified"}
 
 def assert_group_totals_match(source, target, group_columns, value_column, dataset):
-    """Confirm dashboard-level totals agree with the finalized Parquet snapshot."""
-    source_totals = source.groupBy(*group_columns).agg(F.sum(value_column).alias("source_total"))
-    target_totals = target.groupBy(*group_columns).agg(F.sum(value_column).alias("target_total"))
-    mismatch = source_totals.join(target_totals, list(group_columns), "full").where(
-        F.coalesce(F.col("source_total"), F.lit(0)) != F.coalesce(F.col("target_total"), F.lit(0))
-    )
-    if mismatch.limit(1).count():
-        raise RuntimeError(f"{dataset} group totals differ after PostgreSQL load")
-
+    left = source.groupBy(*group_columns).agg(F.sum(value_column).alias("source_total")); right = target.groupBy(*group_columns).agg(F.sum(value_column).alias("target_total"))
+    if left.join(right, list(group_columns), "full").where(F.coalesce(F.col("source_total"), F.lit(0)) != F.coalesce(F.col("target_total"), F.lit(0))).limit(1).count(): raise RuntimeError(f"{dataset} group totals differ after PostgreSQL load")
 
 def load_snapshot(spark, dataset, jdbc_url, user, password, source_path=None):
-    """Validate, truncate, append, and verify one complete Parquet snapshot."""
-    config = DATASETS[dataset]
-    source = source_path or config["path"]
-    frame = spark.read.parquet(str(source))
-    prepared = prepare_vehicle_features(frame) if dataset == "vehicle_features" else prepare_window_metrics(frame)
-    validate_snapshot(prepared, dataset)
-    source_count = prepared.count()
-    properties = jdbc_properties(user, password)
-    truncate_target(spark, jdbc_url, user, password, config["table"])
-    prepared.write.jdbc(jdbc_url, config["table"], mode="append", properties=properties)
-    target = spark.read.jdbc(jdbc_url, config["table"], properties=properties)
-    if target.count() != source_count:
-        raise RuntimeError(f"{dataset} row count differs after PostgreSQL load")
-    if target.groupBy(*config["keys"]).count().where("count > 1").limit(1).count():
-        raise RuntimeError(f"{dataset} contains duplicate primary-key values after PostgreSQL load")
-    if dataset == "vehicle_features":
-        assert_group_totals_match(
-            prepared.withColumn("row_count", F.lit(1)), target.withColumn("row_count", F.lit(1)), ("region",), "row_count", dataset
-        )
+    config = DATASETS[dataset]; frame = PREPARERS[dataset](spark.read.parquet(str(source_path or config["path"])))
+    validate_snapshot(frame, dataset); source_count = frame.count(); properties = jdbc_properties(user, password)
+    if config["snapshot"]: _execute(spark, jdbc_url, user, password, f"TRUNCATE TABLE {config['table']}")
     else:
-        assert_group_totals_match(prepared, target, ("window_start", "window_end"), "event_count", dataset)
-
+        versions = [row.model_version for row in frame.select("model_version").distinct().collect()]
+        if len(versions) != 1: raise ValueError(f"{dataset} must contain exactly one model version")
+        _execute(spark, jdbc_url, user, password, f"DELETE FROM {config['table']} WHERE model_version = '{versions[0]}'")
+    frame.write.jdbc(jdbc_url, config["table"], mode="append", properties=properties)
+    target = spark.read.jdbc(jdbc_url, config["table"], properties=properties)
+    if not config["snapshot"]: target = target.where(F.col("model_version") == versions[0])
+    if target.count() != source_count or target.groupBy(*config["keys"]).count().where("count > 1").limit(1).count(): raise RuntimeError(f"{dataset} did not match PostgreSQL after load")
+    return source_count
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Load a finalized EV Fleet Parquet snapshot into PostgreSQL.")
-    parser.add_argument("--dataset", choices=DATASETS, required=True)
-    parser.add_argument("--master", default=DEFAULT_MASTER)
-    parser.add_argument("--jdbc-url", default=os.environ.get("POSTGRES_JDBC_URL", DEFAULT_JDBC_URL))
-    parser.add_argument("--jdbc-user", default=os.environ.get("POSTGRES_USER", "ev_fleet"))
-    parser.add_argument("--jdbc-password", default=os.environ.get("POSTGRES_PASSWORD"), required=os.environ.get("POSTGRES_PASSWORD") is None)
-    parser.add_argument("--source-path", type=Path)
+    parser = argparse.ArgumentParser(description="Load MATR serving snapshots into PostgreSQL.")
+    parser.add_argument("--dataset", choices=DATASETS, required=True); parser.add_argument("--master", default=DEFAULT_MASTER); parser.add_argument("--jdbc-url", default=os.environ.get("POSTGRES_JDBC_URL", DEFAULT_JDBC_URL)); parser.add_argument("--jdbc-user", default=os.environ.get("POSTGRES_USER", "battery_reliability")); parser.add_argument("--jdbc-password", default=os.environ.get("POSTGRES_PASSWORD"), required=os.environ.get("POSTGRES_PASSWORD") is None); parser.add_argument("--source-path", type=Path)
     return parser.parse_args()
 
-
 def main():
-    args = parse_args()
-    spark = build_spark_session(args.master)
-    spark.sparkContext.setLogLevel("WARN")
-    try:
-        load_snapshot(spark, args.dataset, args.jdbc_url, args.jdbc_user, args.jdbc_password, args.source_path)
-    finally:
-        spark.stop()
+    args = parse_args(); spark = build_spark_session(args.master); spark.sparkContext.setLogLevel("WARN")
+    try: print(f"Loaded {load_snapshot(spark, args.dataset, args.jdbc_url, args.jdbc_user, args.jdbc_password, args.source_path)} {args.dataset} row(s).")
+    finally: spark.stop()
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

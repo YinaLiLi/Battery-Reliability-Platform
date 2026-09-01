@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from src.postgres_loader import assert_group_totals_match, prepare_window_metrics
+from src.postgres_loader import assert_group_totals_match, prepare_battery_cycle_health, prepare_replay_windows
 
 
 @pytest.fixture(scope="module")
@@ -18,23 +18,22 @@ def spark():
     session.stop()
 
 
-def test_prepare_window_metrics_flattens_the_database_primary_key(spark):
+def test_prepare_battery_cycle_health_uses_the_cycle_natural_key(spark):
     source = spark.createDataFrame(
-        [("EV-1", "2025-01-01T00:00:00", "2025-01-01T06:00:00", 2, 317.5, 27.0)],
-        "vehicle_id string, window_start string, window_end string, event_count long, average_pack_voltage double, maximum_module_temperature double",
-    ).selectExpr(
-        "vehicle_id",
-        "named_struct('start', to_timestamp(window_start), 'end', to_timestamp(window_end)) AS window",
-        "event_count",
-        "average_pack_voltage",
-        "maximum_module_temperature",
+        [("MATR", "MATR-1", 1, 0.98, 99, 1.05, 0.01, 28.0, 120.0, -0.001, 0.99)],
+        "dataset string, battery_id string, cycle_index int, soh double, rul_cycles int, discharge_capacity_in_Ah double, internal_resistance_in_ohm double, temperature_max_in_C double, charge_time_in_s double, capacity_slope_10 double, coulombic_efficiency double",
     )
+    row = prepare_battery_cycle_health(source).first()
+    assert (row.dataset, row.battery_id, row.cycle_index, row.soh, row.rul_cycles) == ("MATR", "MATR-1", 1, 0.98, 99)
 
-    row = prepare_window_metrics(source).first()
 
-    assert row.window_start.isoformat() == "2025-01-01T00:00:00"
-    assert row.window_end.isoformat() == "2025-01-01T06:00:00"
-    assert row.vehicle_id == "EV-1"
+def test_prepare_replay_windows_uses_cycle_natural_key(spark):
+    source = spark.createDataFrame(
+        [("MATR-1", 1, 2, 3.2, 27.0, 1.0, 0.9, 0.01)],
+        "battery_id string, cycle_index int, event_count long, average_voltage_in_V double, maximum_temperature_in_C double, charge_capacity_in_Ah double, discharge_capacity_in_Ah double, internal_resistance_in_ohm double",
+    )
+    row = prepare_replay_windows(source).first()
+    assert (row.battery_id, row.cycle_index, row.event_count) == ("MATR-1", 1, 2)
 
 
 def test_group_total_validation_rejects_a_mismatched_database_snapshot(spark):
@@ -42,4 +41,4 @@ def test_group_total_validation_rejects_a_mismatched_database_snapshot(spark):
     target = spark.createDataFrame([("south", 2), ("west", 2)], "region string, rows long")
 
     with pytest.raises(RuntimeError, match="group totals differ"):
-        assert_group_totals_match(source, target, ("region",), "rows", "vehicle_features")
+        assert_group_totals_match(source, target, ("region",), "rows", "battery_cycle_health")
