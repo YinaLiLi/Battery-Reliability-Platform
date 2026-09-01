@@ -1,6 +1,8 @@
-# Battery Reliability Platform — BatteryLife MATR
+# Battery Reliability Platform
 
-This project processes BatteryLife's 169-cell MATR corpus into a battery-reliability platform: measured cycle health (SOH), RUL prediction, deterministic historical replay, streaming health state, and model-serving snapshots for predictive maintenance.
+An end-to-end battery reliability platform built on real BatteryLife MATR aging data. It processes 130,573,638 laboratory measurement rows from 169 batteries across 140,001 cycles with PySpark, supports deterministic Kafka replay and Spark Structured Streaming battery-health state, predicts remaining useful life (RUL) with XGBoost, and serves health and model monitoring through PostgreSQL and Streamlit.
+
+The platform is designed for battery reliability monitoring and predictive maintenance. SOH is a measured/derived health metric, while RUL is the ML-predicted number of cycles remaining.
 
 SOH is a deterministic measured health metric, not an ML target:
 
@@ -10,7 +12,7 @@ The current discharge-capacity signal reconstructs this value directly in MATR. 
 
 ## Architecture
 
-`MATR.zip → canonical Parquet → PySpark causal degradation features → XGBoost RUL evaluation/predictions → PostgreSQL`
+`MATR.zip → canonical Parquet → PySpark causal degradation features → XGBoost RUL evaluation/predictions → PostgreSQL → Streamlit`
 
 `canonical measurement replay → Kafka battery_measurements → Structured Streaming cycle health → PostgreSQL`
 
@@ -18,21 +20,22 @@ Airflow orchestrates the batch path:
 
 `ingest_matr → normalize_matr → build_degradation_features → train_evaluate_models → publish_predictions → load_serving_tables`
 
-The historical Kafka path is a deterministic simulation of source measurement order; MATR does not provide real wall-clock telemetry.
+Kafka replays the laboratory measurement order deterministically; it is not real-time field telemetry.
 
 ## Data and artifacts
 
-The verified official archive is `data/raw/batterylife/MATR.zip`. Canonical outputs under `data/processed/matr/` contain 169 batteries, 140,001 cycle-summary rows, and 130,573,638 measurements.
+The verified official archive is `data/raw/batterylife/MATR.zip`. Canonical outputs under `data/processed/matr/` contain 169 batteries, 140,001 cycles, and 130,573,638 measurement rows.
 
 - Parquet is canonical historical storage.
 - PySpark builds causal degradation features over roughly 130M measurements.
-- Kafka provides a replay and streaming-ingestion abstraction keyed by `battery_id`.
-- Structured Streaming materializes deduplicated battery/cycle health state.
-- ML predicts RUL; measured capacity produces SOH.
-- Airflow performs periodic batch feature and model refreshes.
-- PostgreSQL serves compact health, prediction, replay-window, and evaluation snapshots.
+- Kafka provides deterministic historical replay keyed by `battery_id`.
+- Spark Structured Streaming materializes deduplicated battery/cycle health state.
+- Measured discharge capacity produces SOH; XGBoost predicts RUL.
+- Airflow orchestrates batch feature engineering and model-refresh workflows.
+- PostgreSQL serves compact health, prediction, replay-window, and evaluation snapshots to the dashboard.
+- Streamlit provides battery reliability and model monitoring views.
 
-The frozen lineage-disjoint benchmark and model reports are under `data/processed/matr/`. The selected RUL XGBoost result is validation MAE/RMSE/R² of 56.96 cycles / 95.57 / 0.9477 and test 38.98 / 58.20 / 0.9503. Test MAE is 64.12 early-life, 44.96 mid-life, and 13.21 late-life cycles.
+The frozen lineage-disjoint benchmark and model reports are under `data/processed/matr/`. The finalized XGBoost model has frozen test MAE/RMSE/R² of approximately 38.98 / 58.20 / 0.9503, with lifecycle MAE of 64.12 / 44.96 / 13.21 cycles (early/mid/late). After applying the physical serving constraint `predicted_rul_cycles = max(0, raw_predicted_rul_cycles)`, constrained operational test MAE is approximately 38.94 cycles and R² remains approximately 0.9503.
 
 ## Local services
 

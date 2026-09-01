@@ -2,11 +2,12 @@
 import os
 
 import pandas as pd
+import plotly.express as px
 import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
 
-from src.dashboard_data import lifecycle_stage, lowest_rows, model_metrics, soh_percent
+from src.dashboard_data import lifecycle_stage, model_metrics, soh_percent
 
 
 @st.cache_resource
@@ -57,17 +58,43 @@ def fleet_page():
     st.bar_chart(histogram, x_label="Measured SOH (%)", y_label="Batteries")
     st.caption("No high-risk label is applied; reliability thresholds have not been approved.")
 
-    rankings = st.columns(2)
-    lowest_soh = pd.DataFrame(lowest_rows(fleet.to_dict("records"), "measured_soh"))
-    lowest_soh["Measured SOH (%)"] = lowest_soh["measured_soh"].map(soh_percent)
-    rankings[0].subheader("Lowest measured SOH")
-    rankings[0].dataframe(lowest_soh[["battery_id", "current_cycle", "Measured SOH (%)"]].rename(columns={"battery_id": "Battery", "current_cycle": "Current cycle"}), hide_index=True, width="stretch", column_config={"Measured SOH (%)": st.column_config.NumberColumn(format="%.1f")})
-    rankings[1].subheader("Lowest champion-predicted RUL")
-    lowest_rul = pd.DataFrame(lowest_rows(fleet.to_dict("records"), "predicted_rul_cycles"))
-    if lowest_rul.empty:
-        rankings[1].caption("No champion prediction is available.")
+    st.subheader("Battery health map")
+    chart_data = fleet[fleet["predicted_rul_cycles"].notna()].copy()
+    if chart_data.empty:
+        st.info("No champion prediction is available.")
     else:
-        rankings[1].dataframe(lowest_rul[["battery_id", "current_cycle", "predicted_rul_cycles", "estimated_eol_cycle"]].rename(columns={"battery_id": "Battery", "current_cycle": "Current cycle", "predicted_rul_cycles": "Predicted RUL (cycles)", "estimated_eol_cycle": "Estimated EOL cycle"}), hide_index=True, width="stretch")
+        chart_data["Measured SOH (%)"] = chart_data["measured_soh"].map(soh_percent)
+        chart_data["Predicted RUL (cycles)"] = chart_data["predicted_rul_cycles"]
+        chart_data["Lifecycle stage"] = [lifecycle_stage(row.current_cycle, row.predicted_rul_cycles) for row in chart_data.itertuples()]
+        cycle_min, cycle_max = chart_data["current_cycle"].min(), chart_data["current_cycle"].max()
+        chart_data["Bubble size"] = 18.0 if cycle_min == cycle_max else 10.0 + 16.0 * (chart_data["current_cycle"] - cycle_min) / (cycle_max - cycle_min)
+        figure = px.scatter(
+            chart_data,
+            x="Measured SOH (%)",
+            y="Predicted RUL (cycles)",
+            size="Bubble size",
+            size_max=24,
+            custom_data=["battery_id"],
+            hover_name="battery_id",
+            hover_data={
+                "current_cycle": ":.0f",
+                "Measured SOH (%)": ":.1f",
+                "Predicted RUL (cycles)": ":.1f",
+                "estimated_eol_cycle": ":.0f",
+                "Lifecycle stage": True,
+                "Bubble size": False,
+                "battery_id": False,
+            },
+            labels={"current_cycle": "Current cycle", "estimated_eol_cycle": "Estimated EOL cycle"},
+        )
+        figure.update_traces(marker={"opacity": 0.78, "line": {"width": 0.6, "color": "white"}})
+        figure.update_layout(height=460, margin={"l": 10, "r": 10, "t": 10, "b": 10}, showlegend=False)
+        event = st.plotly_chart(figure, width="stretch", on_select="rerun", selection_mode=("points", "box", "lasso"))
+        st.caption("One bubble per battery with a champion prediction. Bubble size reflects current cycle; lower SOH/RUL values sit toward the lower-left without a risk classification.")
+        if event and event.selection.points:
+            st.session_state.battery_id = event.selection.points[0]["customdata"][0]
+            st.session_state.page = "Battery detail"
+            st.rerun()
 
     st.subheader("Battery table")
     with st.expander("Filters", expanded=False):
