@@ -7,7 +7,7 @@ import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
 
-from src.dashboard_data import lifecycle_stage, model_display_names, model_metrics, soh_percent
+from src.dashboard_data import family_validation_rows, lifecycle_stage, latest_model_version, model_display_names, model_metrics, selectable_models, soh_percent
 
 
 @st.cache_resource
@@ -33,6 +33,31 @@ def evaluations():
     )
 
 
+def current_model(models):
+    models = selectable_models(models)
+    if not models:
+        return None
+    versions = [model["model_version"] for model in models]
+    selected = st.session_state.get("current_model_version")
+    if selected not in versions:
+        selected = latest_model_version(models)
+        st.session_state.current_model_version = selected
+    return next(model for model in models if model["model_version"] == selected)
+
+
+def model_predictions(dataset, model_version):
+    return pd.DataFrame(rows(
+        """
+        SELECT DISTINCT ON (battery_id) battery_id, predicted_rul_cycles,
+               predicted_eol_cycle, prediction_created_at
+        FROM analytics.battery_predictions
+        WHERE dataset = %(dataset)s AND model_version = %(model_version)s
+        ORDER BY battery_id, cycle_index DESC
+        """,
+        {"dataset": dataset, "model_version": model_version},
+    ))
+
+
 def fleet_page():
     st.header("Battery reliability monitoring")
     fleet = pd.DataFrame(rows("SELECT * FROM analytics.dashboard_battery_latest ORDER BY battery_id"))
@@ -40,15 +65,19 @@ def fleet_page():
         st.info("No serving data is available.")
         return
 
-    champion = fleet["champion_model_version"].dropna().iloc[0] if fleet["champion_model_version"].notna().any() else None
-    model_names = model_display_names(evaluations())
-    champion_name = model_names.get(champion, "No champion promoted")
-    st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {champion_name}.")
+    models = evaluations()
+    selected_model = current_model(models)
+    selected_version = selected_model["model_version"] if selected_model else None
+    selected_name = model_display_names(models).get(selected_version, "Unavailable")
+    if selected_version:
+        prediction_frame = model_predictions(fleet.iloc[0]["dataset"], selected_version)
+        fleet = fleet.drop(columns=["predicted_rul_cycles", "predicted_eol_cycle", "prediction_created_at"], errors="ignore").merge(prediction_frame, on="battery_id", how="left")
+    st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {selected_name}.")
     metrics = st.columns(5)
     metrics[0].metric("Batteries tracked", len(fleet))
     metrics[1].metric("Average SOH", f"{fleet['measured_soh'].mean():.1%}")
     metrics[2].metric("Median SOH", f"{fleet['measured_soh'].median():.1%}")
-    metrics[3].metric("Current champion model", champion_name)
+    metrics[3].metric("Current model", selected_name)
     metrics[4].metric("RUL predictions available", int(fleet["predicted_rul_cycles"].notna().sum()))
 
     st.subheader("Measured SOH distribution")
@@ -56,7 +85,7 @@ def fleet_page():
     histogram = soh_values.groupby(pd.cut(soh_values, bins=10, include_lowest=True), observed=False).size()
     histogram.index = [f"{interval.left:.0f}–{interval.right:.0f}%" for interval in histogram.index]
     st.bar_chart(histogram, x_label="Measured SOH (%)", y_label="Batteries")
-    st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {champion_name}.")
+    st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {selected_name}.")
 
     st.subheader("Battery table")
     with st.expander("Filters", expanded=False):
@@ -81,7 +110,7 @@ def fleet_page():
         )
     filtered = fleet[fleet["battery_id"].str.contains(search, case=False, na=False)]
     filtered = filtered[filtered["measured_soh"].map(soh_percent) >= min_soh]
-    if champion:
+    if selected_version:
         filtered = filtered[filtered["predicted_rul_cycles"].fillna(float("inf")) <= max_rul]
     filtered = filtered.assign(lifecycle_stage=[lifecycle_stage(row.current_cycle, row.predicted_rul_cycles) for row in filtered.itertuples()])
     filtered["measured_soh_percent"] = filtered["measured_soh"].map(soh_percent)
@@ -90,14 +119,14 @@ def fleet_page():
             "battery_id": "Battery",
             "current_cycle": "Current cycle",
             "measured_soh_percent": "Measured SOH (%)",
-            "predicted_rul_cycles": "Champion predicted RUL (cycles)",
+            "predicted_rul_cycles": "Predicted RUL (cycles)",
             "estimated_eol_cycle": "Estimated EOL cycle",
             "lifecycle_stage": "Lifecycle stage",
             "prediction_created_at": "Prediction timestamp",
         }
     )
     event = st.dataframe(
-        visible[["Battery", "Current cycle", "Measured SOH (%)", "Champion predicted RUL (cycles)", "Estimated EOL cycle", "Lifecycle stage", "Prediction timestamp"]],
+        visible[["Battery", "Current cycle", "Measured SOH (%)", "Predicted RUL (cycles)", "Estimated EOL cycle", "Lifecycle stage", "Prediction timestamp"]],
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -121,14 +150,27 @@ def battery_page():
     latest = fleet.loc[fleet["battery_id"] == battery_id].iloc[0]
     models = evaluations()
     model_names = model_display_names(models)
-    champion_name = model_names.get(latest.champion_model_version, "No champion promoted")
+    selected_model = current_model(models)
+    selected_version = selected_model["model_version"] if selected_model else None
+    selected_name = model_names.get(selected_version, "Unavailable")
+    selected_prediction = rows(
+        """
+        SELECT predicted_rul_cycles, predicted_eol_cycle
+        FROM analytics.battery_predictions
+        WHERE model_version = %(model_version)s AND dataset = %(dataset)s AND battery_id = %(battery_id)s
+        ORDER BY cycle_index DESC LIMIT 1
+        """,
+        {"model_version": selected_version, "dataset": latest.dataset, "battery_id": battery_id},
+    ) if selected_version else []
+    latest_rul = selected_prediction[0]["predicted_rul_cycles"] if selected_prediction else None
+    latest_eol = selected_prediction[0]["predicted_eol_cycle"] if selected_prediction else None
     cards = st.columns(5)
     cards[0].metric("Current cycle", int(latest.current_cycle))
     cards[1].metric("Measured SOH", f"{latest.measured_soh:.1%}")
-    cards[2].metric(f"Predicted RUL · {champion_name}", "Unavailable" if pd.isna(latest.predicted_rul_cycles) else f"{latest.predicted_rul_cycles:.0f} cycles")
-    cards[3].metric("Estimated EOL cycle", "Unavailable" if pd.isna(latest.estimated_eol_cycle) else f"{latest.estimated_eol_cycle:.0f}")
-    cards[4].metric("Lifecycle stage", lifecycle_stage(latest.current_cycle, latest.predicted_rul_cycles))
-    st.caption("Measured SOH/capacity is not an ML prediction. Candidate RUL is never presented as the fleet’s operational forecast.")
+    cards[2].metric(f"Predicted RUL · {selected_name}", "Unavailable" if latest_rul is None else f"{latest_rul:.0f} cycles")
+    cards[3].metric("Estimated EOL cycle", "Unavailable" if latest_eol is None else f"{latest_eol:.0f}")
+    cards[4].metric("Lifecycle stage", lifecycle_stage(latest.current_cycle, latest_rul))
+    st.caption("Measured SOH/capacity is independent of the selected model.")
 
     health = pd.DataFrame(rows(
         """
@@ -153,13 +195,11 @@ def battery_page():
     trends[1].caption("Internal resistance (Ω)")
     trends[1].line_chart(health.set_index("cycle_index")[["internal_resistance_in_ohm"]])
 
-    versions = [model["model_version"] for model in models]
-    champion = next((model["model_version"] for model in models if model["status"] == "champion"), None)
-    if not versions:
+    if not selected_version:
         st.info("No model prediction history is available.")
         return
-    selected = st.selectbox("RUL model history", versions, index=versions.index(champion) if champion else 0, format_func=lambda version: model_names.get(version, version))
-    selected_status = next(model["status"] for model in models if model["model_version"] == selected)
+    selected = selected_version
+    selected_status = selected_model["status"]
     predictions = pd.DataFrame(rows(
         """
         SELECT cycle_index, raw_predicted_rul_cycles, predicted_rul_cycles, predicted_eol_cycle
@@ -170,7 +210,7 @@ def battery_page():
         {"model_version": selected, "dataset": latest.dataset, "battery_id": battery_id},
     ))
     st.subheader("ML-predicted RUL history")
-    st.caption(f"{model_names.get(selected, selected)} · internal version: {selected}. Selected model status: {selected_status}. {'Operational champion forecast.' if selected_status == 'champion' else 'Candidate result for evaluation only.'}")
+    st.caption(f"{model_names.get(selected, selected)} · internal version: {selected}. Selected model status: {selected_status}.")
     if predictions.empty:
         st.info("This model has no prediction history for the selected battery.")
     else:
@@ -195,15 +235,47 @@ def model_page():
     if not models:
         st.info("No model evaluations are available.")
         return
-    champion = next((model for model in models if model["status"] == "champion"), None)
     model_names = model_display_names(models)
-    champion_name = model_names.get(champion["model_version"], "No champion promoted") if champion else "No champion promoted"
-    st.metric("Current champion", champion_name)
-    st.caption("This view is read-only. Candidate promotion remains a future human-controlled database operation.")
+    active = selectable_models(models)
+    selected_model = current_model(models)
+    versions = [model["model_version"] for model in active]
+    if selected_model:
+        st.selectbox(
+            "Current model",
+            versions,
+            index=versions.index(selected_model["model_version"]),
+            key="current_model_version",
+            format_func=lambda version: model_names.get(version, version),
+        )
+    st.caption("The Current model is selected for dashboard analysis; database audit statuses are unchanged.")
     flattened = pd.DataFrame([model_metrics(model) for model in models])
     flattened.insert(0, "Display model", [model_names.get(model["model_version"], model["model_version"]) for model in models])
     flattened = flattened.rename(columns={"Model version": "Internal model version"})
-    st.dataframe(flattened, hide_index=True, width="stretch")
+    flattened.insert(1, "Selection", ["Current" if model.get("model_version") == st.session_state.get("current_model_version") else "" for model in models])
+    metric_columns = ["Validation MAE", "Test MAE", "Test RMSE", "Test R²", "Early MAE", "Mid MAE", "Late MAE"]
+    st.dataframe(flattened.style.background_gradient(cmap="Blues", subset=metric_columns), hide_index=True, width="stretch")
+
+    generation_version = st.selectbox(
+        "Generation validation comparison",
+        [model["model_version"] for model in active],
+        format_func=lambda version: model_names.get(version, version),
+    )
+    generation_model = next(model for model in active if model["model_version"] == generation_version)
+    family_validation = pd.DataFrame(family_validation_rows(generation_model))
+    if family_validation.empty:
+        st.info("This legacy evaluation does not contain family-level validation results.")
+    else:
+        st.caption("Family and configuration selection use validation data only. The selected family is marked below.")
+        st.dataframe(family_validation, hide_index=True, width="stretch")
+        st.altair_chart(
+            alt.Chart(family_validation).mark_bar().encode(
+                x=alt.X("Model family:N", sort=["Ridge", "Random Forest", "XGBoost", "MLP"]),
+                y="Validation MAE:Q",
+                color=alt.Color("Selected:N", scale=alt.Scale(domain=[False, True], range=["#9aa0a6", "#1f77b4"])),
+                tooltip=["Model family", "Configuration", "Validation MAE", "Validation RMSE", "Validation R²", "Selected"],
+            ),
+            width="stretch",
+        )
 
     st.subheader("Metric definitions")
     st.markdown(
@@ -213,21 +285,18 @@ def model_page():
 - R² — How well the model explains differences in remaining battery life; closer to 1 is better."""
     )
 
-    candidates = [model for model in models if model["status"] == "candidate"]
-    baseline = champion or min(candidates, key=lambda model: model_names.get(model["model_version"], model["model_version"]), default=None)
-    if not baseline:
-        st.info("No candidate or champion model is available for comparison.")
+    if not active:
+        st.info("No model is available for comparison.")
         return
-    if not champion:
-        st.caption("No champion is promoted; comparison uses the first candidate as its evaluation baseline.")
-    candidate_options = [model["model_version"] for model in candidates if model["model_version"] != baseline["model_version"]]
+    baseline = selected_model or active[-1]
+    candidate_options = [model["model_version"] for model in active if model["model_version"] != baseline["model_version"]]
     selected_candidates = st.multiselect(
         "Add models to compare",
         options=candidate_options,
         default=[],
         format_func=lambda version: model_names.get(version, version),
         max_selections=4,
-        help="The champion, or the first candidate when no champion is promoted, is always included.",
+        help="The Current model is always included.",
     )
     selected_versions = [baseline["model_version"], *selected_candidates]
     selected_models = [model for model in models if model["model_version"] in selected_versions]
@@ -263,7 +332,7 @@ def model_page():
     st.subheader("Model metadata")
     for model in selected_models:
         display_name = model_names.get(model["model_version"], model["model_version"])
-        heading = f"{display_name} ({'champion' if model['status'] == 'champion' else model['status']})"
+        heading = f"{display_name} ({model['status']})"
         with st.expander(heading):
             st.markdown(f"**Internal model version:** `{model['model_version']}`")
             st.markdown(f"**Status:** {model['status']}")

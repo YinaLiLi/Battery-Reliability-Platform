@@ -1,6 +1,14 @@
 import json
 
-from src.dashboard_data import lifecycle_stage, lowest_rows, model_display_names, model_metrics, soh_percent
+from src.dashboard_data import (
+    lifecycle_stage,
+    lowest_rows,
+    model_display_names,
+    model_metrics,
+    selectable_models,
+    latest_model_version,
+    soh_percent,
+)
 
 
 def test_lifecycle_stage_is_unknown_without_a_model_prediction():
@@ -30,6 +38,10 @@ def test_model_metrics_flattens_evaluation_and_keeps_missing_training_metadata_u
 
     assert model_metrics(evaluation) == {
         "Model version": "candidate-1",
+        "Generation": "Not recorded",
+        "Selected model family": "Not Recorded",
+        "Training batteries": "Not recorded",
+        "Model fingerprint": "Not recorded",
         "Status": "candidate",
         "Validation MAE": 14.0,
         "Evaluated at": "2026-09-01T00:00:00Z",
@@ -55,11 +67,42 @@ def test_model_display_names_are_stable_and_hide_internal_ids_from_primary_label
 def test_model_display_names_use_generation_metadata_and_exclude_retired_models():
     models = [
         {"model_version": "legacy", "status": "retired", "evaluated_at": "2026-09-01", "training_metadata": {"generation": 0}},
-        {"model_version": "snapshot-1", "status": "candidate", "evaluated_at": "2026-09-02", "training_metadata": {"generation": 1}},
-        {"model_version": "snapshot-0", "status": "candidate", "evaluated_at": "2026-09-01", "training_metadata": {"generation": 0}},
+        {"model_version": "snapshot-1", "model_name": "mlp", "status": "candidate", "evaluated_at": "2026-09-02", "training_metadata": {"generation": "1.1"}},
+        {"model_version": "snapshot-0", "model_name": "ridge", "status": "candidate", "evaluated_at": "2026-09-01", "training_metadata": {"generation": "1.0"}},
     ]
 
-    assert model_display_names(models) == {"snapshot-0": "XGBoost 1.0", "snapshot-1": "XGBoost 1.1"}
+    assert model_display_names(models) == {"snapshot-0": "Model 1.0 — Ridge", "snapshot-1": "Model 1.1 — MLP"}
+
+
+def test_model_metrics_exposes_generation_selection_and_family_validation_results():
+    evaluation = {
+        "model_version": "model-1-2",
+        "model_name": "random_forest",
+        "status": "candidate",
+        "evaluated_at": "2026-09-02T00:00:00Z",
+        "model_fingerprint": "abc123",
+        "generation": "1.2",
+        "metrics": {"test": {"mae": 12.0, "rmse": 18.0, "r2": 0.9}, "lifecycle_stage_mae": {}, "family_validation": {"ridge": {"config_id": "a", "validation": {"mae": 13.0, "rmse": 19.0, "r2": 0.8}}}},
+        "training_metadata": {"training_battery_count": 76, "selected_family": "random_forest"},
+    }
+
+    flattened = model_metrics(evaluation)
+
+    assert flattened["Generation"] == "1.2"
+    assert flattened["Selected model family"] == "Random Forest"
+    assert flattened["Training batteries"] == 76
+    assert flattened["Model fingerprint"] == "abc123"
+
+
+def test_selectable_models_exclude_retired_and_latest_is_default():
+    models = [
+        {"model_version": "legacy", "status": "retired", "training_metadata": {"generation": 99}},
+        {"model_version": "v1", "status": "candidate", "training_metadata": {"generation": 1}},
+        {"model_version": "v3", "status": "candidate", "training_metadata": {"generation": 3}},
+        {"model_version": "v2", "status": "candidate", "training_metadata": {"generation": 2}},
+    ]
+    assert [model["model_version"] for model in selectable_models(models)] == ["v1", "v2", "v3"]
+    assert latest_model_version(models) == "v3"
 
 
 def test_soh_percent_converts_measured_fraction_for_display():
