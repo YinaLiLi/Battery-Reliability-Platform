@@ -36,7 +36,29 @@ def test_generation_plan_uses_only_completed_valid_train_batteries_in_arrival_or
     assert plan["training_battery_count"] == 26
     assert plan["battery_ids"] == [f"battery-{index:03}" for index in range(26)]
     assert plan["generation"] == "1.0"
-    assert plan["model_version"].startswith("matr-rul-xgboost-1.0-")
+    assert plan["model_version"].startswith("matr-rul-model-1.0-")
+
+
+def test_validation_selection_chooses_the_best_non_xgboost_family_and_breaks_ties_deterministically():
+    selected = training.select_validation_winner(
+        {
+            "ridge": {"config_id": "ridge-a", "validation": {"mae": 10.0, "rmse": 15.0, "r2": 0.7}},
+            "random_forest": {"config_id": "rf-a", "validation": {"mae": 10.0, "rmse": 14.0, "r2": 0.7}},
+            "xgboost": {"config_id": "xgb-a", "validation": {"mae": 9.0, "rmse": 20.0, "r2": 0.7}},
+            "mlp": {"config_id": "mlp-a", "validation": {"mae": 8.0, "rmse": 30.0, "r2": 0.7}},
+        }
+    )
+    assert selected["family"] == "mlp"
+
+    tied = training.select_validation_winner(
+        {
+            "ridge": {"config_id": "ridge-a", "validation": {"mae": 10.0, "rmse": 15.0, "r2": 0.7}},
+            "random_forest": {"config_id": "rf-a", "validation": {"mae": 10.0, "rmse": 15.0, "r2": 0.7}},
+            "xgboost": {"config_id": "xgb-a", "validation": {"mae": 11.0, "rmse": 15.0, "r2": 0.7}},
+            "mlp": {"config_id": "mlp-a", "validation": {"mae": 12.0, "rmse": 15.0, "r2": 0.7}},
+        }
+    )
+    assert tied["family"] == "ridge"
 
 
 def test_generation_plan_skips_published_threshold_and_is_fingerprint_idempotent(tmp_path):

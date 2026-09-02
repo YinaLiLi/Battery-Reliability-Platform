@@ -30,7 +30,9 @@ def prepare_predictions(frame):
 
 def prepare_evaluations(frame):
     metadata = F.col("training_metadata_json") if "training_metadata_json" in frame.columns else F.lit("{}")
-    return frame.select("model_version", "model_name", "dataset", "status", F.to_timestamp("evaluated_at").alias("evaluated_at"), F.col("metrics_json").alias("metrics"), metadata.alias("training_metadata"))
+    fingerprint = F.col("model_fingerprint") if "model_fingerprint" in frame.columns else F.lit(None).cast("string")
+    generation = F.col("generation").cast("string") if "generation" in frame.columns else F.lit(None).cast("string")
+    return frame.select("model_version", "model_name", "dataset", "status", F.to_timestamp("evaluated_at").alias("evaluated_at"), F.col("metrics_json").alias("metrics"), metadata.alias("training_metadata"), fingerprint.alias("model_fingerprint"), generation.alias("generation"))
 
 PREPARERS = {"battery_cycle_health": prepare_battery_cycle_health, "battery_replay_windows": prepare_replay_windows, "battery_predictions": prepare_predictions, "model_evaluations": prepare_evaluations}
 

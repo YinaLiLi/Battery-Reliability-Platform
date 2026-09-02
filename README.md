@@ -1,6 +1,6 @@
 # Battery Reliability Platform
 
-An end-to-end battery reliability platform built on BatteryLife MATR historical aging data. It processes 130,573,638 laboratory measurement rows from 169 batteries across 140,001 cycles with PySpark, supports deterministic simulated replay and Spark Structured Streaming battery-health state, predicts remaining useful life (RUL) with XGBoost, and serves health and model monitoring through PostgreSQL and Streamlit.
+An end-to-end battery reliability platform built on BatteryLife MATR historical aging data. It processes 130,573,638 laboratory measurement rows from 169 batteries across 140,001 cycles with PySpark, supports deterministic simulated replay and Spark Structured Streaming battery-health state, selects an RUL regression model at each training snapshot, and serves health and model monitoring through PostgreSQL and Streamlit.
 
 The platform is designed for battery reliability monitoring and predictive maintenance. SOH is a measured/derived health metric, while RUL is the ML-predicted number of cycles remaining.
 
@@ -12,7 +12,7 @@ The current discharge-capacity signal reconstructs this value directly in MATR. 
 
 ## Architecture
 
-`MATR.zip → canonical Parquet → PySpark causal degradation features → XGBoost RUL evaluation/predictions → PostgreSQL → Streamlit`
+`MATR.zip → canonical Parquet → PySpark causal degradation features → RUL model selection/evaluation/predictions → PostgreSQL → Streamlit`
 
 `arrival manifest + deterministic staggered replay → Kafka battery_measurements → Structured Streaming cycle health → PostgreSQL`
 
@@ -39,19 +39,14 @@ The verified official archive is `data/raw/batterylife/MATR.zip`. Canonical outp
 - PySpark builds causal degradation features over roughly 130M measurements.
 - Kafka provides deterministic historical replay keyed by `battery_id`.
 - Spark Structured Streaming materializes deduplicated battery/cycle health state.
-- Measured discharge capacity produces SOH; XGBoost predicts RUL.
+- Measured discharge capacity produces SOH; the validation-selected model predicts RUL.
 - Airflow orchestrates batch feature engineering and model-refresh workflows.
 - PostgreSQL serves compact health, prediction, replay-window, and evaluation snapshots to the dashboard.
 - Streamlit provides battery reliability and model monitoring views.
 
 The frozen lineage-disjoint benchmark cohorts are under `data/processed/matr/` and use fixed validation/test IDs across all generations.
 
-Genuine XGBoost generations and constrained validation test MAE are:
-
-- `matr-rul-xgboost-1.0-*` → 26 training batteries, Test MAE 50.81
-- `matr-rul-xgboost-1.1-*` → 51 training batteries, Test MAE 43.81
-- `matr-rul-xgboost-1.2-*` → 76 training batteries, Test MAE 39.89
-- `matr-rul-xgboost-1.3-*` → 94 training batteries, Test MAE 38.70
+Continuous generations are neutral snapshots: `Model 1.0`, `Model 1.1`, `Model 1.2`, and `Model 1.3` correspond to 26, 51, 76, and 94 training batteries. Each trains Ridge, Random Forest, XGBoost, and MLP candidates using the fixed validation cohort, selects by validation MAE (then RMSE and fixed family order), and evaluates only the winner on the fixed test cohort.
 
 Legacy full-pool generations are retained in PostgreSQL as retired audit rows.
 

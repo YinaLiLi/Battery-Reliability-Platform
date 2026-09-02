@@ -94,15 +94,15 @@ def test_model_metrics_exposes_generation_selection_and_family_validation_result
     assert flattened["Model fingerprint"] == "abc123"
 
 
-def test_selectable_models_exclude_retired_and_latest_is_default():
+def test_selectable_models_exclude_retired_and_best_fixed_test_mae_is_default():
     models = [
         {"model_version": "legacy", "status": "retired", "training_metadata": {"generation": 99}},
-        {"model_version": "v1", "status": "candidate", "training_metadata": {"generation": 1}},
-        {"model_version": "v3", "status": "candidate", "training_metadata": {"generation": 3}},
-        {"model_version": "v2", "status": "candidate", "training_metadata": {"generation": 2}},
+        {"model_version": "v1", "status": "candidate", "training_metadata": {"generation": 1}, "metrics": {"test": {"mae": 50.15}}},
+        {"model_version": "v3", "status": "candidate", "training_metadata": {"generation": 3}, "metrics": {"test": {"mae": 47.49}}},
+        {"model_version": "v2", "status": "candidate", "training_metadata": {"generation": 2}, "metrics": {"test": {"mae": 42.53}}},
     ]
     assert [model["model_version"] for model in selectable_models(models)] == ["v1", "v2", "v3"]
-    assert latest_model_version(models) == "v3"
+    assert latest_model_version(models) == "v2"
 
 
 def test_soh_percent_converts_measured_fraction_for_display():

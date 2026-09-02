@@ -100,6 +100,13 @@ def selectable_models(models):
 
 
 def latest_model_version(models):
-    """Return the newest selectable generation, if any."""
+    """Return the best fixed-test-MAE selectable generation, if recorded."""
     active = selectable_models(models)
-    return active[-1]["model_version"] if active else None
+    if not active:
+        return None
+    def test_mae(model):
+        metrics = model.get("metrics") or {}
+        if isinstance(metrics, str):
+            metrics = json.loads(metrics)
+        return metrics.get("test", {}).get("mae", float("inf"))
+    return min(active, key=lambda model: (test_mae(model), model["model_version"]))["model_version"]

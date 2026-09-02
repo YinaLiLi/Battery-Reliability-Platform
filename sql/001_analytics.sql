@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS analytics.model_evaluations (
     evaluated_at TIMESTAMPTZ NOT NULL, metrics JSONB NOT NULL,
     training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     model_fingerprint TEXT,
-    generation INTEGER
+    generation TEXT
 );
 CREATE INDEX IF NOT EXISTS model_evaluations_status_idx ON analytics.model_evaluations (status, evaluated_at DESC);
 
@@ -70,6 +70,8 @@ ALTER TABLE analytics.model_evaluations
     ADD COLUMN IF NOT EXISTS model_fingerprint TEXT;
 ALTER TABLE analytics.model_evaluations
     ADD COLUMN IF NOT EXISTS generation INTEGER;
+ALTER TABLE analytics.model_evaluations
+    ALTER COLUMN generation TYPE TEXT USING generation::TEXT;
 ALTER TABLE analytics.model_evaluations DROP CONSTRAINT IF EXISTS model_evaluations_status_check;
 ALTER TABLE analytics.model_evaluations
     ADD CONSTRAINT model_evaluations_status_check CHECK (status IN ('candidate', 'champion', 'retired'));

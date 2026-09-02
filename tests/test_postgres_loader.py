@@ -36,15 +36,15 @@ def test_prepare_replay_windows_uses_cycle_natural_key(spark):
     assert (row.battery_id, row.cycle_index, row.event_count) == ("MATR-1", 1, 2)
 
 
-def test_prepare_evaluations_defaults_missing_training_metadata_for_existing_artifacts(spark):
+def test_prepare_evaluations_persists_generation_and_fingerprint_with_legacy_defaults(spark):
     source = spark.createDataFrame(
-        [("candidate-1", "xgboost", "MATR", "candidate", "2026-09-01T00:00:00Z", "{}")],
-        "model_version string, model_name string, dataset string, status string, evaluated_at string, metrics_json string",
+        [("candidate-1", "ridge", "MATR", "candidate", "2026-09-01T00:00:00Z", "{}", "fp-1", "1.0")],
+        "model_version string, model_name string, dataset string, status string, evaluated_at string, metrics_json string, model_fingerprint string, generation string",
     )
 
     row = prepare_evaluations(source).first()
 
-    assert row.training_metadata == "{}"
+    assert (row.training_metadata, row.model_fingerprint, row.generation) == ("{}", "fp-1", "1.0")
 
 
 def test_prediction_validation_rejects_negative_served_rul(spark):
