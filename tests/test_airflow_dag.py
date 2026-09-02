@@ -13,3 +13,14 @@ def test_matr_pipeline_has_one_linear_retraining_path():
     assert dag.get_task("train_evaluate_models").downstream_task_ids == {"publish_predictions"}
     assert dag.get_task("load_serving_tables").downstream_task_ids == set()
     assert "exec /opt/spark/bin/spark-submit" not in dag.get_task("load_serving_tables").bash_command
+
+
+def test_continuous_retraining_dag_checks_daily_before_training_a_candidate():
+    dag = DagBag(dag_folder=str(Path(__file__).resolve().parents[1] / "airflow")).dags.get("matr_continuous_retraining")
+    assert dag is not None
+    assert dag.schedule is not None
+    assert list(dag.task_ids) == ["check_retraining_eligibility", "load_candidate_generation"]
+    assert "--continuous" in dag.get_task("check_retraining_eligibility").bash_command
+    loader = dag.get_task("load_candidate_generation").bash_command
+    assert "publish_predictions.py --artifact-dir $candidate_dir" in loader
+    assert "published_predictions.parquet" in loader

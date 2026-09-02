@@ -62,3 +62,35 @@ with DAG(
     )
 
     ingest_matr >> normalize_matr >> build_degradation_features >> train_evaluate_models >> publish_predictions >> load_serving_tables
+
+
+with DAG(
+    dag_id="matr_continuous_retraining",
+    description="Check daily simulated lifecycle eligibility and publish one RUL candidate generation.",
+    start_date=datetime(2025, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    max_active_runs=1,
+    default_args=DEFAULT_ARGS,
+    tags=["matr", "battery-reliability", "continuous-retraining"],
+) as continuous_dag:
+    check_retraining_eligibility = BashOperator(
+        task_id="check_retraining_eligibility",
+        bash_command="cd /opt/project && exec python3 src/train_matr_models.py --continuous",
+        retries=1,
+    )
+    load_candidate_generation = BashOperator(
+        task_id="load_candidate_generation",
+        bash_command=(
+            "cd /opt/project && if test -f data/processed/matr/latest_candidate_generation.txt; then "
+            "candidate_dir=$(cat data/processed/matr/latest_candidate_generation.txt) && "
+            "python3 src/publish_predictions.py --artifact-dir $candidate_dir && "
+            "/opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.postgresql:postgresql:42.7.7 "
+            "src/postgres_loader.py --dataset battery_predictions --source-path $candidate_dir/published_predictions.parquet && "
+            "/opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.postgresql:postgresql:42.7.7 "
+            "src/postgres_loader.py --dataset model_evaluations --source-path $candidate_dir/published_model_evaluation.parquet; "
+            "else echo 'No candidate generation to load'; fi"
+        ),
+        retries=1,
+    )
+    check_retraining_eligibility >> load_candidate_generation

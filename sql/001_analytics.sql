@@ -12,26 +12,42 @@ CREATE INDEX IF NOT EXISTS battery_cycle_health_battery_cycle_idx ON analytics.b
 
 CREATE TABLE IF NOT EXISTS analytics.battery_predictions (
     model_version TEXT NOT NULL, dataset TEXT NOT NULL, battery_id TEXT NOT NULL, cycle_index INTEGER NOT NULL CHECK (cycle_index > 0),
-    raw_predicted_rul_cycles DOUBLE PRECISION, predicted_rul_cycles DOUBLE PRECISION NOT NULL CHECK (predicted_rul_cycles >= 0), prediction_created_at TIMESTAMPTZ NOT NULL, split TEXT NOT NULL,
+    raw_predicted_rul_cycles DOUBLE PRECISION, predicted_rul_cycles DOUBLE PRECISION NOT NULL CHECK (predicted_rul_cycles >= 0), predicted_eol_cycle DOUBLE PRECISION, prediction_created_at TIMESTAMPTZ NOT NULL, split TEXT NOT NULL,
     PRIMARY KEY (model_version, dataset, battery_id, cycle_index)
 );
 CREATE INDEX IF NOT EXISTS battery_predictions_battery_cycle_idx ON analytics.battery_predictions (battery_id, cycle_index);
 
 ALTER TABLE analytics.battery_predictions
     ADD COLUMN IF NOT EXISTS raw_predicted_rul_cycles DOUBLE PRECISION;
+ALTER TABLE analytics.battery_predictions
+    ADD COLUMN IF NOT EXISTS predicted_eol_cycle DOUBLE PRECISION;
 UPDATE analytics.battery_predictions
 SET raw_predicted_rul_cycles = predicted_rul_cycles
 WHERE raw_predicted_rul_cycles IS NULL;
 UPDATE analytics.battery_predictions
 SET predicted_rul_cycles = GREATEST(0, predicted_rul_cycles)
 WHERE predicted_rul_cycles < 0;
+WITH eol AS (
+    SELECT model_version, dataset, battery_id, cycle_index,
+        MIN(cycle_index) FILTER (WHERE predicted_rul_cycles = 0) OVER (PARTITION BY model_version, dataset, battery_id) AS first_eol_cycle
+    FROM analytics.battery_predictions
+)
+UPDATE analytics.battery_predictions AS prediction
+SET predicted_rul_cycles = CASE WHEN eol.first_eol_cycle IS NOT NULL AND prediction.cycle_index >= eol.first_eol_cycle THEN 0 ELSE prediction.predicted_rul_cycles END,
+    predicted_eol_cycle = CASE
+        WHEN eol.first_eol_cycle IS NOT NULL AND prediction.cycle_index >= eol.first_eol_cycle THEN eol.first_eol_cycle
+        ELSE prediction.cycle_index + prediction.predicted_rul_cycles
+    END
+FROM eol
+WHERE (prediction.model_version, prediction.dataset, prediction.battery_id, prediction.cycle_index) = (eol.model_version, eol.dataset, eol.battery_id, eol.cycle_index);
+ALTER TABLE analytics.battery_predictions
+    ALTER COLUMN predicted_eol_cycle SET NOT NULL;
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'battery_predictions_nonnegative_rul') THEN
         ALTER TABLE analytics.battery_predictions
             ADD CONSTRAINT battery_predictions_nonnegative_rul CHECK (predicted_rul_cycles >= 0);
     END IF;
 END $$;
-
 CREATE TABLE IF NOT EXISTS analytics.battery_replay_windows (
     battery_id TEXT NOT NULL, cycle_index INTEGER NOT NULL CHECK (cycle_index > 0), event_count BIGINT NOT NULL CHECK (event_count > 0),
     average_voltage_in_v DOUBLE PRECISION, maximum_temperature_in_c DOUBLE PRECISION,
@@ -40,14 +56,25 @@ CREATE TABLE IF NOT EXISTS analytics.battery_replay_windows (
 );
 
 CREATE TABLE IF NOT EXISTS analytics.model_evaluations (
-    model_version TEXT PRIMARY KEY, model_name TEXT NOT NULL, dataset TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('candidate', 'champion')),
+    model_version TEXT PRIMARY KEY, model_name TEXT NOT NULL, dataset TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('candidate', 'champion', 'retired')),
     evaluated_at TIMESTAMPTZ NOT NULL, metrics JSONB NOT NULL,
-    training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    model_fingerprint TEXT,
+    generation INTEGER
 );
 CREATE INDEX IF NOT EXISTS model_evaluations_status_idx ON analytics.model_evaluations (status, evaluated_at DESC);
 
 ALTER TABLE analytics.model_evaluations
     ADD COLUMN IF NOT EXISTS training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE analytics.model_evaluations
+    ADD COLUMN IF NOT EXISTS model_fingerprint TEXT;
+ALTER TABLE analytics.model_evaluations
+    ADD COLUMN IF NOT EXISTS generation INTEGER;
+ALTER TABLE analytics.model_evaluations DROP CONSTRAINT IF EXISTS model_evaluations_status_check;
+ALTER TABLE analytics.model_evaluations
+    ADD CONSTRAINT model_evaluations_status_check CHECK (status IN ('candidate', 'champion', 'retired'));
+CREATE UNIQUE INDEX IF NOT EXISTS model_evaluations_fingerprint_idx
+    ON analytics.model_evaluations (model_fingerprint) WHERE model_fingerprint IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS battery_cycle_health_latest_idx
     ON analytics.battery_cycle_health (dataset, battery_id, cycle_index DESC);
@@ -55,7 +82,8 @@ CREATE INDEX IF NOT EXISTS battery_cycle_health_latest_idx
 CREATE UNIQUE INDEX IF NOT EXISTS model_evaluations_one_champion_per_dataset_idx
     ON analytics.model_evaluations (dataset) WHERE status = 'champion';
 
-CREATE OR REPLACE VIEW analytics.dashboard_battery_latest AS
+DROP VIEW IF EXISTS analytics.dashboard_battery_latest;
+CREATE VIEW analytics.dashboard_battery_latest AS
 WITH latest_health AS (
     SELECT DISTINCT ON (dataset, battery_id)
         dataset, battery_id, cycle_index, soh, discharge_capacity_in_ah,
@@ -78,8 +106,9 @@ SELECT
     health.capacity_slope_10,
     champion.model_version AS champion_model_version,
     prediction.predicted_rul_cycles AS predicted_rul_cycles,
+    prediction.predicted_eol_cycle,
     prediction.prediction_created_at,
-    health.cycle_index + prediction.predicted_rul_cycles AS estimated_eol_cycle
+    prediction.predicted_eol_cycle AS estimated_eol_cycle
 FROM latest_health AS health
 LEFT JOIN champion ON champion.dataset = health.dataset
 LEFT JOIN analytics.battery_predictions AS prediction

@@ -7,8 +7,10 @@ from pathlib import Path
 import pyarrow.dataset as ds
 try:
     from .battery_events import event_from_measurement
+    from .continuous_arrival import lifecycle_events_for_manifest, schedule_measurement
 except ImportError:
     from battery_events import event_from_measurement
+    from continuous_arrival import lifecycle_events_for_manifest, schedule_measurement
 
 try:
     from confluent_kafka import Producer
@@ -17,7 +19,9 @@ except ImportError:  # Lets unit tests run before the optional runtime dependenc
 
 
 TOPIC = "battery_measurements"
+LIFECYCLE_TOPIC = "battery_lifecycle"
 DEFAULT_INPUT = Path("data/processed/matr/cycle_measurements")
+DEFAULT_MANIFEST = Path("data/processed/matr/arrival_manifest.parquet")
 
 
 def telemetry_rows(path, limit, battery_ids=None, limit_per_battery=0):
@@ -25,8 +29,9 @@ def telemetry_rows(path, limit, battery_ids=None, limit_per_battery=0):
     yielded = 0
     per_battery = {}
     dataset = ds.dataset(path, format="parquet")
-    for fragment in dataset.get_fragments():
-        for batch in fragment.to_batches(batch_size=1000):
+    filter_expression = ds.field("battery_id").isin(sorted(battery_ids)) if battery_ids else None
+    for fragment in dataset.get_fragments(filter=filter_expression):
+        for batch in fragment.to_batches(batch_size=1000, filter=filter_expression):
             for row in batch.to_pylist():
                 if battery_ids and limit_per_battery and all(per_battery.get(key, 0) >= limit_per_battery for key in battery_ids):
                     return
@@ -41,6 +46,20 @@ def telemetry_rows(path, limit, battery_ids=None, limit_per_battery=0):
                 per_battery[row["battery_id"]] = per_battery.get(row["battery_id"], 0) + 1
 
 
+def scheduled_replay_events(measurements, manifest, *, include_lifecycle=True):
+    """Schedule telemetry and independent lifecycle facts in one stable replay order."""
+    by_battery = {row["battery_id"]: row for row in manifest}
+    events = []
+    for row in measurements:
+        events.append((0, schedule_measurement(row, by_battery[row["battery_id"]], replay_sequence=0)))
+    if include_lifecycle:
+        for manifest_row in manifest:
+            for lifecycle in lifecycle_events_for_manifest(manifest_row):
+                events.append((1 if lifecycle["event_type"] == "eol_observed" else 2, lifecycle))
+    for sequence, (_, event) in enumerate(sorted(events, key=lambda item: (item[1]["replay_event_time"], item[0], item[1]["battery_id"], item[1].get("cycle_index", 0), item[1].get("sample_index", 0)))):
+        yield {**event, "replay_sequence": sequence}
+
+
 def produce_rows(rows, producer, limit=1000):
     """Queue telemetry for asynchronous delivery and raise only after flushing."""
     delivery_errors = []
@@ -53,9 +72,9 @@ def produce_rows(rows, producer, limit=1000):
     for row in rows:
         if limit and sent >= limit:
             break
-        event = event_from_measurement(row)
+        event = row if row.get("event_type") else event_from_measurement(row)
         producer.produce(
-            topic=TOPIC,
+            topic=LIFECYCLE_TOPIC if event.get("event_type") else TOPIC,
             key=event["battery_id"].encode(),
             value=json.dumps(event, separators=(",", ":")),
             on_delivery=delivered,
@@ -74,8 +93,9 @@ def produce_rows(rows, producer, limit=1000):
 def parse_args():
     parser = argparse.ArgumentParser(description="Replay MATR measurements to Kafka.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--bootstrap-server", default="localhost:9092")
-    parser.add_argument("--limit", type=int, default=1000, help="Rows to send; 0 sends all rows.")
+    parser.add_argument("--limit", type=int, default=0, help="Rows to send; 0 sends all rows.")
     parser.add_argument("--battery-id", action="append", dest="battery_ids", help="Restrict bounded verification replay to one or more batteries.")
     parser.add_argument("--limit-per-battery", type=int, default=0, help="Maximum events per selected battery; 0 disables the per-battery bound.")
     return parser.parse_args()
@@ -95,8 +115,12 @@ def main():
             "acks": "all",
         }
     )
-    sent = produce_rows(telemetry_rows(args.input, args.limit, set(args.battery_ids or []), args.limit_per_battery), producer, args.limit)
-    print(f"Delivered {sent} event(s) to {TOPIC}.")
+    measurements = telemetry_rows(args.input, args.limit, set(args.battery_ids or []), args.limit_per_battery)
+    manifest = ds.dataset(args.manifest, format="parquet").to_table().to_pylist()
+    if args.battery_ids:
+        manifest = [row for row in manifest if row["battery_id"] in set(args.battery_ids)]
+    sent = produce_rows(scheduled_replay_events(measurements, manifest, include_lifecycle=not args.limit and not args.limit_per_battery), producer, 0)
+    print(f"Delivered {sent} scheduled event(s) to {TOPIC} and {LIFECYCLE_TOPIC}.")
 
 
 if __name__ == "__main__":

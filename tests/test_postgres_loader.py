@@ -57,6 +57,19 @@ def test_prediction_validation_rejects_negative_served_rul(spark):
         validate_snapshot(prepare_predictions(source), "battery_predictions")
 
 
+def test_prediction_validation_rejects_recovery_after_predicted_eol(spark):
+    source = spark.createDataFrame(
+        [
+            ("model-1", "MATR", "MATR-1", 10, 0.0, 10.0, "2026-09-01T00:00:00Z", "test"),
+            ("model-1", "MATR", "MATR-1", 11, 2.0, 13.0, "2026-09-01T00:00:00Z", "test"),
+        ],
+        "model_version string, dataset string, battery_id string, cycle_index int, predicted_rul_cycles double, predicted_eol_cycle double, prediction_created_at string, split string",
+    )
+
+    with pytest.raises(ValueError, match="irreversible predicted EOL"):
+        validate_snapshot(prepare_predictions(source), "battery_predictions")
+
+
 def test_group_total_validation_rejects_a_mismatched_database_snapshot(spark):
     source = spark.createDataFrame([("south", 2), ("west", 3)], "region string, rows long")
     target = spark.createDataFrame([("south", 2), ("west", 2)], "region string, rows long")

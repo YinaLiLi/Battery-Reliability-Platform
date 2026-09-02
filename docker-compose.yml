@@ -60,7 +60,9 @@ services:
         condition: service_healthy
     command: >-
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists
-      --topic battery_measurements --partitions 3 --replication-factor 1
+      --topic battery_measurements --partitions 3 --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic battery_lifecycle --partitions 3 --replication-factor 1
 
   spark-master:
     build:

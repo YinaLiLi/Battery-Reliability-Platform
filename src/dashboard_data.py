@@ -29,11 +29,13 @@ def model_metrics(evaluation):
     if isinstance(metrics, str):
         metrics = json.loads(metrics)
     test = metrics.get("test", {})
+    validation = metrics.get("validation", {})
     stage = metrics.get("lifecycle_stage_mae", {})
     metadata = evaluation.get("training_metadata") or {}
     training_data = metadata.get("training_data_version", "Not recorded")
     return {
         "Model version": evaluation["model_version"],
+        "Validation MAE": validation.get("mae"),
         "Status": evaluation["status"],
         "Evaluated at": str(evaluation["evaluated_at"]),
         "Test MAE": test.get("mae"),
@@ -44,3 +46,23 @@ def model_metrics(evaluation):
         "Late MAE": stage.get("late"),
         "Training data": training_data,
     }
+
+
+def model_display_names(models):
+    """Return stable short labels while retaining internal IDs as metadata."""
+    active = [model for model in models if model["status"] in {"candidate", "champion"}]
+    if not any((model.get("training_metadata") or {}).get("generation") is not None for model in active):
+        champion = next((model for model in active if model["status"] == "champion"), None)
+        names = {champion["model_version"]: "XGBoost 1.0"} if champion else {}
+        candidates = sorted((model for model in active if model["status"] == "candidate"), key=lambda model: (str(model.get("evaluated_at", "")), model["model_version"]))
+        names.update({model["model_version"]: f"XGBoost 1.{index + 1}" for index, model in enumerate(candidates)})
+        return names
+    ordered = sorted(
+        active,
+        key=lambda model: (
+            (model.get("training_metadata") or {}).get("generation", float("inf")),
+            str(model.get("evaluated_at", "")),
+            model["model_version"],
+        ),
+    )
+    return {model["model_version"]: f"XGBoost 1.{index}" for index, model in enumerate(ordered)}

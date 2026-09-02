@@ -84,6 +84,9 @@ def test_normalize_archive_writes_three_canonical_parquet_tables(tmp_path):
 
     outputs = normalize_archive(raw, labels, tmp_path / "processed")
 
-    assert set(outputs) == {"battery_dim", "cycle_summary", "cycle_measurements", "matr_provenance"}
+    assert set(outputs) == {"battery_dim", "cycle_summary", "cycle_measurements", "matr_provenance", "arrival_manifest"}
     assert pq.read_table(outputs["cycle_summary"]).num_rows == 2
     assert pq.read_table(outputs["cycle_measurements"]).num_rows == 4
+    manifest = pq.read_table(outputs["arrival_manifest"]).to_pylist()
+    assert manifest[0]["label_status"] == "valid_observed_endpoint"
+    assert manifest[0]["split"] in {"train", "validation", "test"}

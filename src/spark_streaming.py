@@ -10,7 +10,9 @@ DEFAULT_MASTER = "spark://spark-master:7077"
 DEFAULT_BOOTSTRAP_SERVER = "kafka:29092"
 DEFAULT_OUTPUT_PATH = Path("data/processed/matr/replay_cycle_health")
 DEFAULT_CHECKPOINT_PATH = Path("data/processed/matr/replay_checkpoint")
+DEFAULT_LIFECYCLE_OUTPUT_PATH = Path("data/processed/matr/replay_lifecycle_state")
 TOPIC = "battery_measurements"
+LIFECYCLE_TOPIC = "battery_lifecycle"
 SHUFFLE_PARTITIONS = 3
 MAX_OFFSETS_PER_TRIGGER = 100
 WATERMARK_DELAY = "2 hours"
@@ -24,6 +26,7 @@ TELEMETRY_SCHEMA = T.StructType(
         T.StructField("sample_index", T.IntegerType()),
         T.StructField("source_time_in_s", T.DoubleType()),
         T.StructField("replay_event_time", T.StringType()),
+        T.StructField("replay_sequence", T.LongType()),
         T.StructField("voltage_in_V", T.DoubleType()),
         T.StructField("current_in_A", T.DoubleType()),
         T.StructField("temperature_in_C", T.DoubleType()),
@@ -33,6 +36,17 @@ TELEMETRY_SCHEMA = T.StructType(
         T.StructField("schema_version", T.StringType()),
     ]
 )
+
+LIFECYCLE_SCHEMA = T.StructType([
+    T.StructField("event_id", T.StringType()),
+    T.StructField("event_type", T.StringType()),
+    T.StructField("dataset", T.StringType()),
+    T.StructField("battery_id", T.StringType()),
+    T.StructField("cycle_index", T.IntegerType()),
+    T.StructField("replay_event_time", T.StringType()),
+    T.StructField("replay_sequence", T.LongType()),
+    T.StructField("schema_version", T.StringType()),
+])
 
 
 def build_spark_session(master=DEFAULT_MASTER):
@@ -58,6 +72,18 @@ def parse_telemetry(kafka_records):
         .select("payload.*")
         .withColumn("event_time", F.to_timestamp("replay_event_time"))
         .where(F.col("event_id").isNotNull() & F.col("dataset").isNotNull() & F.col("battery_id").isNotNull() & F.col("cycle_index").isNotNull() & F.col("sample_index").isNotNull() & F.col("event_time").isNotNull() & (F.col("schema_version") == "1.0"))
+    )
+
+
+def parse_lifecycle(kafka_records):
+    """Decode the immutable EOL and replay-completion facts."""
+    payload = F.from_json(F.col("value").cast("string"), LIFECYCLE_SCHEMA)
+    return (
+        kafka_records.select(payload.alias("payload"))
+        .where(F.col("payload").isNotNull())
+        .select("payload.*")
+        .withColumn("event_time", F.to_timestamp("replay_event_time"))
+        .where(F.col("event_id").isNotNull() & F.col("battery_id").isNotNull() & F.col("event_time").isNotNull() & F.col("event_type").isin("eol_observed", "replay_complete") & (F.col("schema_version") == "1.0"))
     )
 
 
@@ -96,6 +122,16 @@ def build_window_metrics(telemetry):
     return _render_cycle_health(_cycle_health_aggregates(deduplicate_events(telemetry)))
 
 
+def build_lifecycle_state(lifecycle):
+    """Materialize EOL observation independently from source replay completion."""
+    return deduplicate_events(lifecycle).groupBy("battery_id").agg(
+        F.max(F.when(F.col("event_type") == "eol_observed", 1).otherwise(0)).cast("boolean").alias("eol_observed"),
+        F.max(F.when(F.col("event_type") == "replay_complete", 1).otherwise(0)).cast("boolean").alias("replay_complete"),
+        F.max(F.when(F.col("event_type") == "eol_observed", F.col("event_time"))).alias("eol_observed_at"),
+        F.max(F.when(F.col("event_type") == "replay_complete", F.col("event_time"))).alias("replay_complete_at"),
+    )
+
+
 def upsert_cycle_health(batch, _batch_id, output_path):
     """Merge a micro-batch into canonical Parquet by (battery_id, cycle_index)."""
     if batch.rdd.isEmpty():
@@ -122,19 +158,39 @@ def upsert_cycle_health(batch, _batch_id, output_path):
         health.unpersist()
 
 
-def start_query(spark, output_path, checkpoint_path, available_now=False):
+def upsert_lifecycle_state(batch, _batch_id, output_path):
+    """Merge immutable lifecycle facts into one state row per battery."""
+    if batch.rdd.isEmpty():
+        return
+    output_path = Path(output_path)
+    incoming = build_lifecycle_state(batch)
+    if output_path.exists():
+        incoming = incoming.unionByName(batch.sparkSession.read.parquet(str(output_path)))
+    state = incoming.groupBy("battery_id").agg(
+        F.max(F.col("eol_observed").cast("int")).cast("boolean").alias("eol_observed"),
+        F.max(F.col("replay_complete").cast("int")).cast("boolean").alias("replay_complete"),
+        F.max("eol_observed_at").alias("eol_observed_at"),
+        F.max("replay_complete_at").alias("replay_complete_at"),
+    )
+    state.write.mode("overwrite").parquet(str(output_path))
+
+
+def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAULT_LIFECYCLE_OUTPUT_PATH, available_now=False):
     """Start the checkpointed Kafka query and return its StreamingQuery."""
     kafka_records = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", DEFAULT_BOOTSTRAP_SERVER)
-        .option("subscribe", TOPIC)
+        .option("subscribe", f"{TOPIC},{LIFECYCLE_TOPIC}")
         .option("startingOffsets", "earliest")
         .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
         .load()
     )
-    events = deduplicate_events(parse_telemetry(kafka_records))
+    def process_batch(batch, batch_id):
+        upsert_cycle_health(deduplicate_events(parse_telemetry(batch)), batch_id, output_path)
+        upsert_lifecycle_state(deduplicate_events(parse_lifecycle(batch)), batch_id, lifecycle_output_path)
+
     writer = (
-        events.writeStream.foreachBatch(lambda batch, batch_id: upsert_cycle_health(batch, batch_id, output_path))
+        kafka_records.writeStream.foreachBatch(process_batch)
         .outputMode("append")
         .option("checkpointLocation", str(checkpoint_path))
     )
@@ -146,6 +202,7 @@ def parse_args():
     parser.add_argument("--master", default=DEFAULT_MASTER)
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CHECKPOINT_PATH)
+    parser.add_argument("--lifecycle-output-path", type=Path, default=DEFAULT_LIFECYCLE_OUTPUT_PATH)
     parser.add_argument("--available-now", action="store_true", help="Process current offsets in bounded micro-batches, then exit.")
     return parser.parse_args()
 
@@ -155,7 +212,7 @@ def main():
     spark = build_spark_session(args.master)
     spark.sparkContext.setLogLevel("WARN")
     try:
-        query = start_query(spark, args.output_path, args.checkpoint_path, args.available_now)
+        query = start_query(spark, args.output_path, args.checkpoint_path, args.lifecycle_output_path, args.available_now)
         query.awaitTermination()
     finally:
         spark.stop()

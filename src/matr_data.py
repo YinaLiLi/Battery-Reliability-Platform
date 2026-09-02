@@ -9,7 +9,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+
+try:
+    from .continuous_arrival import build_arrival_manifest
+    from .matr_stage2 import lineage_split
+except ImportError:
+    from continuous_arrival import build_arrival_manifest
+    from matr_stage2 import lineage_split
 
 
 DATASET = "MATR"
@@ -197,7 +205,13 @@ def normalize_archive(raw_dir, labels_path, output_dir, *, continuations=None):
         _write_rows(outputs["cycle_measurements"] / f"part-{len(loaded):04d}.parquet", samples, MEASUREMENT_SCHEMA)
     if not loaded:
         raise ValueError(f"no MATR pickle files in {raw_dir}")
-    outputs["matr_provenance"] = _write_rows(
-        output_dir / "matr_provenance.parquet", build_provenance(loaded, continuations=continuations), PROVENANCE_SCHEMA
+    provenance = build_provenance(loaded, continuations=continuations)
+    outputs["matr_provenance"] = _write_rows(output_dir / "matr_provenance.parquet", provenance, PROVENANCE_SCHEMA)
+    manifest = build_arrival_manifest(
+        provenance,
+        ds.dataset(outputs["cycle_summary"], format="parquet").to_table(columns=["battery_id", "cycle_index", "eol_cycle"]).to_pylist(),
+        lineage_split(provenance),
     )
+    outputs["arrival_manifest"] = output_dir / "arrival_manifest.parquet"
+    pq.write_table(pa.Table.from_pylist(manifest), outputs["arrival_manifest"])
     return outputs

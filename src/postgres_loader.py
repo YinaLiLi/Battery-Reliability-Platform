@@ -25,7 +25,8 @@ def prepare_replay_windows(frame):
 
 def prepare_predictions(frame):
     raw = F.col("raw_predicted_rul_cycles") if "raw_predicted_rul_cycles" in frame.columns else F.col("predicted_rul_cycles")
-    return frame.select("model_version", "dataset", "battery_id", "cycle_index", raw.alias("raw_predicted_rul_cycles"), "predicted_rul_cycles", F.to_timestamp("prediction_created_at").alias("prediction_created_at"), "split")
+    eol = F.col("predicted_eol_cycle") if "predicted_eol_cycle" in frame.columns else F.col("cycle_index") + F.col("predicted_rul_cycles")
+    return frame.select("model_version", "dataset", "battery_id", "cycle_index", raw.alias("raw_predicted_rul_cycles"), "predicted_rul_cycles", eol.alias("predicted_eol_cycle"), F.to_timestamp("prediction_created_at").alias("prediction_created_at"), "split")
 
 def prepare_evaluations(frame):
     metadata = F.col("training_metadata_json") if "training_metadata_json" in frame.columns else F.lit("{}")
@@ -38,7 +39,13 @@ def validate_snapshot(frame, dataset):
     if frame.where(F.expr(" OR ".join(f"{key} IS NULL" for key in keys))).limit(1).count() or frame.groupBy(*keys).count().where("count > 1").limit(1).count():
         raise ValueError(f"{dataset} has null or duplicate natural keys")
     if dataset == "battery_cycle_health" and frame.where((F.col("cycle_index") <= 0) | (F.col("soh") < 0)).limit(1).count(): raise ValueError("battery_cycle_health has invalid values")
-    if dataset == "battery_predictions" and frame.where(F.col("predicted_rul_cycles") < 0).limit(1).count(): raise ValueError("battery_predictions has negative served RUL")
+    if dataset == "battery_predictions":
+        if frame.where(F.col("predicted_rul_cycles") < 0).limit(1).count(): raise ValueError("battery_predictions has negative served RUL")
+        from pyspark.sql.window import Window
+        trajectory = Window.partitionBy("model_version", "dataset", "battery_id").orderBy("cycle_index").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        first_eol = F.min(F.when(F.col("predicted_rul_cycles") == 0, F.col("cycle_index"))).over(trajectory)
+        checked = frame.withColumn("first_eol", first_eol)
+        if checked.where(((F.col("first_eol").isNotNull()) & ((F.col("predicted_rul_cycles") != 0) | (F.col("predicted_eol_cycle") != F.col("first_eol")))) | ((F.col("first_eol").isNull()) & (F.col("predicted_eol_cycle") != F.col("cycle_index") + F.col("predicted_rul_cycles")))).limit(1).count(): raise ValueError("battery_predictions violates irreversible predicted EOL")
     if dataset == "battery_replay_windows" and frame.where(F.col("event_count") <= 0).limit(1).count(): raise ValueError("battery_replay_windows has invalid values")
 
 def _execute(spark, jdbc_url, user, password, sql):

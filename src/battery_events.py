@@ -1,7 +1,7 @@
 """Versioned Kafka contract for deterministic MATR historical replay."""
 
 SCHEMA_VERSION = "1.0"
-EVENT_FIELDS = ("event_id","dataset","battery_id","cycle_index","sample_index","source_time_in_s","replay_event_time","voltage_in_V","current_in_A","temperature_in_C","charge_capacity_in_Ah","discharge_capacity_in_Ah","internal_resistance_in_ohm")
+EVENT_FIELDS = ("event_id","dataset","battery_id","cycle_index","sample_index","source_time_in_s","replay_event_time","replay_sequence","voltage_in_V","current_in_A","temperature_in_C","charge_capacity_in_Ah","discharge_capacity_in_Ah","internal_resistance_in_ohm")
 
 def event_from_measurement(row):
     event={field:row.get(field) for field in EVENT_FIELDS}

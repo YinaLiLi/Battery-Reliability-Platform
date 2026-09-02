@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from src.spark_streaming import build_window_metrics, parse_telemetry, upsert_cycle_health
+from src.spark_streaming import build_lifecycle_state, build_window_metrics, parse_lifecycle, parse_telemetry, upsert_cycle_health
 
 
 @pytest.fixture(scope="module")
@@ -48,3 +48,16 @@ def test_upsert_cycle_health_merges_the_same_natural_key(spark, tmp_path):
     assert len(result) == 1
     assert result[0].event_count == 3
     assert result[0].average_voltage_in_V == pytest.approx(3.2)
+
+
+def test_lifecycle_state_keeps_completion_separate_from_eol_observation(spark):
+    records = spark.createDataFrame([
+        ('{"event_id":"complete","event_type":"replay_complete","dataset":"MATR","battery_id":"unverified","cycle_index":4,"replay_event_time":"2020-01-04T00:00:00","schema_version":"1.0"}',),
+        ('{"event_id":"eol","event_type":"eol_observed","dataset":"MATR","battery_id":"valid","cycle_index":3,"replay_event_time":"2020-01-03T00:00:00","schema_version":"1.0"}',),
+        ('{"event_id":"valid-complete","event_type":"replay_complete","dataset":"MATR","battery_id":"valid","cycle_index":4,"replay_event_time":"2020-01-04T00:00:00","schema_version":"1.0"}',),
+    ], "value string")
+
+    state = {row.battery_id: row for row in build_lifecycle_state(parse_lifecycle(records)).collect()}
+
+    assert (state["unverified"].replay_complete, state["unverified"].eol_observed) == (True, False)
+    assert (state["valid"].replay_complete, state["valid"].eol_observed) == (True, True)

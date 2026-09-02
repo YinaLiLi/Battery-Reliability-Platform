@@ -1,6 +1,6 @@
 import json
 
-from src.dashboard_data import lifecycle_stage, lowest_rows, model_metrics, soh_percent
+from src.dashboard_data import lifecycle_stage, lowest_rows, model_display_names, model_metrics, soh_percent
 
 
 def test_lifecycle_stage_is_unknown_without_a_model_prediction():
@@ -21,6 +21,7 @@ def test_model_metrics_flattens_evaluation_and_keeps_missing_training_metadata_u
         "metrics": json.dumps(
             {
                 "test": {"mae": 12.5, "rmse": 20.0, "r2": 0.91},
+                "validation": {"mae": 14.0},
                 "lifecycle_stage_mae": {"early": 18.0, "mid": 12.0, "late": 7.0},
             }
         ),
@@ -30,6 +31,7 @@ def test_model_metrics_flattens_evaluation_and_keeps_missing_training_metadata_u
     assert model_metrics(evaluation) == {
         "Model version": "candidate-1",
         "Status": "candidate",
+        "Validation MAE": 14.0,
         "Evaluated at": "2026-09-01T00:00:00Z",
         "Test MAE": 12.5,
         "Test RMSE": 20.0,
@@ -39,6 +41,25 @@ def test_model_metrics_flattens_evaluation_and_keeps_missing_training_metadata_u
         "Late MAE": 7.0,
         "Training data": "Not recorded",
     }
+
+
+def test_model_display_names_are_stable_and_hide_internal_ids_from_primary_labels():
+    models = [
+        {"model_version": "candidate-b", "status": "candidate", "evaluated_at": "2026-09-02"},
+        {"model_version": "champion-id", "status": "champion", "evaluated_at": "2026-09-01"},
+        {"model_version": "candidate-a", "status": "candidate", "evaluated_at": "2026-09-01"},
+    ]
+    assert model_display_names(models) == {"champion-id": "XGBoost 1.0", "candidate-a": "XGBoost 1.1", "candidate-b": "XGBoost 1.2"}
+
+
+def test_model_display_names_use_generation_metadata_and_exclude_retired_models():
+    models = [
+        {"model_version": "legacy", "status": "retired", "evaluated_at": "2026-09-01", "training_metadata": {"generation": 0}},
+        {"model_version": "snapshot-1", "status": "candidate", "evaluated_at": "2026-09-02", "training_metadata": {"generation": 1}},
+        {"model_version": "snapshot-0", "status": "candidate", "evaluated_at": "2026-09-01", "training_metadata": {"generation": 0}},
+    ]
+
+    assert model_display_names(models) == {"snapshot-0": "XGBoost 1.0", "snapshot-1": "XGBoost 1.1"}
 
 
 def test_soh_percent_converts_measured_fraction_for_display():
