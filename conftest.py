@@ -1,4 +1,5 @@
 import pytest
+
 from src.spark_environment import configure_local_python
 
 
