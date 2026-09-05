@@ -1,5 +1,6 @@
 """Small presentation helpers for the read-only reliability dashboard."""
 import json
+import math
 
 import pandas as pd
 
@@ -51,6 +52,26 @@ def _canonical_family_hint(value):
 
 def soh_percent(soh):
     return round(soh * 100, 2)
+
+
+def measured_soh_distribution(fleet, bin_width=5):
+    """Count observed current-battery SOH measurements in fixed percentage bins."""
+    values = pd.to_numeric(fleet["measured_soh"], errors="coerce").dropna() * 100
+    if values.empty:
+        return pd.DataFrame(columns=["Measured SOH bin", "Battery count"])
+    lower = math.floor(values.min() / bin_width) * bin_width
+    upper = math.ceil(values.max() / bin_width) * bin_width
+    if upper <= values.max():
+        upper += bin_width
+    bins = list(range(int(lower), int(upper) + bin_width, bin_width))
+    counts = pd.cut(values, bins=bins, right=False, include_lowest=True).value_counts(sort=False)
+    counts = counts[counts > 0]
+    return pd.DataFrame(
+        {
+            "Measured SOH bin": [f"{interval.left:.0f}–{interval.right:.0f}%" for interval in counts.index],
+            "Battery count": counts.to_numpy(),
+        }
+    )
 
 
 def lowest_rows(rows, field, limit=5):

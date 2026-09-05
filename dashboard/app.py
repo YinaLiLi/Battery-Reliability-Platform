@@ -8,7 +8,7 @@ import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
 
-from src.dashboard_data import family_label, family_validation_rows, lifecycle_stage, latest_model_version, model_display_names, model_metrics, performance_gradient, selectable_models, soh_percent, survival_family_validation_rows, survival_model_metrics
+from src.dashboard_data import family_label, family_validation_rows, lifecycle_stage, latest_model_version, measured_soh_distribution, model_display_names, model_metrics, performance_gradient, selectable_models, soh_percent, survival_family_validation_rows, survival_model_metrics
 
 
 @st.cache_resource
@@ -214,10 +214,15 @@ def fleet_page():
     st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {selected_name}.")
 
     st.subheader("Measured SOH distribution")
-    soh_values = fleet["measured_soh"].map(soh_percent)
-    histogram = soh_values.groupby(pd.cut(soh_values, bins=10, include_lowest=True), observed=False).size()
-    histogram.index = [f"{interval.left:.0f}–{interval.right:.0f}%" for interval in histogram.index]
-    st.bar_chart(histogram, x_label="Measured SOH (%)", y_label="Batteries")
+    histogram = measured_soh_distribution(fleet)
+    st.altair_chart(
+        alt.Chart(histogram).mark_bar().encode(
+            x=alt.X("Measured SOH bin:N", sort=None, title="Measured SOH (%)"),
+            y=alt.Y("Battery count:Q", title="Batteries (count)", axis=alt.Axis(format="d")),
+            tooltip=["Measured SOH bin:N", "Battery count:Q"],
+        ),
+        width="stretch",
+    )
 
     st.subheader("Battery table")
     with st.expander("Filters", expanded=False):

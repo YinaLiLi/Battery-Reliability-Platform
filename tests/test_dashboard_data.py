@@ -1,8 +1,11 @@
 import json
 
+import pandas as pd
+
 from src.dashboard_data import (
     lifecycle_stage,
     lowest_rows,
+    measured_soh_distribution,
     model_display_names,
     model_metrics,
     selectable_models,
@@ -152,6 +155,29 @@ def test_selectable_models_exclude_retired_and_best_fixed_test_mae_is_default():
 
 def test_soh_percent_converts_measured_fraction_for_display():
     assert soh_percent(0.7301) == 73.01
+
+
+def test_measured_soh_distribution_counts_current_batteries_in_fixed_nonempty_bins():
+    fleet = pd.DataFrame(
+        {
+            "battery_id": ["a", "b", "c", "d", "e", "missing"],
+            "current_cycle": [100, 120, 140, 160, 180, 200],
+            "measured_soh": [0.801, 0.824, 0.841, 0.877, 0.879, None],
+        }
+    )
+
+    assert measured_soh_distribution(fleet).to_dict("records") == [
+        {"Measured SOH bin": "80–85%", "Battery count": 3},
+        {"Measured SOH bin": "85–90%", "Battery count": 2},
+    ]
+
+
+def test_measured_soh_distribution_never_collapses_a_single_value_bin_label():
+    fleet = pd.DataFrame({"battery_id": ["a", "b"], "measured_soh": [0.88, 0.88]})
+
+    assert measured_soh_distribution(fleet).to_dict("records") == [
+        {"Measured SOH bin": "85–90%", "Battery count": 2},
+    ]
 
 
 def test_lowest_rows_ranks_available_values_without_assigning_risk():
