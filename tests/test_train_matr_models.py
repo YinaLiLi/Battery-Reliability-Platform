@@ -39,6 +39,20 @@ def test_generation_plan_uses_only_completed_valid_train_batteries_in_arrival_or
     assert plan["model_version"].startswith("matr-rul-model-1.0-")
 
 
+def test_generation_plan_uses_the_stream_manifest_eligibility_allowlist_when_supplied():
+    manifest = _manifest()
+    plan = training.generation_plan(
+        manifest,
+        [],
+        set(),
+        eligible_battery_ids=[f"battery-{index:03}" for index in range(30)],
+        stream_state_id="stream-state-abc",
+    )
+
+    assert plan["training_battery_count"] == 26
+    assert plan["metadata"]["stream_state_id"] == "stream-state-abc"
+
+
 def test_validation_selection_chooses_the_best_non_xgboost_family_and_breaks_ties_deterministically():
     selected = training.select_validation_winner(
         {

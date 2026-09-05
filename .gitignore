@@ -1,11 +1,25 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/
 .DS_Store
 .env
+*.log
+logs/
 
 data/raw/
 data/processed/
+models/
+checkpoints/
+spark-warehouse/
+postgres-data/
+airflow.db
+standalone_admin_password.txt
+preflight.json
+spark.json
+survival.json
 
 .ipynb_checkpoints/
 docs/PROJECT_HANDOFF.md

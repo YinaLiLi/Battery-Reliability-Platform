@@ -1,0 +1,5 @@
+FROM python:3.10-slim
+WORKDIR /opt/project
+COPY requirements.survival-serving.txt /tmp/requirements.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
+CMD ["python", "-m", "src.survival_serving_worker"]

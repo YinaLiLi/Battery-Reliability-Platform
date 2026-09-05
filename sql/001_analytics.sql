@@ -17,6 +17,14 @@ CREATE TABLE IF NOT EXISTS analytics.battery_predictions (
 );
 CREATE INDEX IF NOT EXISTS battery_predictions_battery_cycle_idx ON analytics.battery_predictions (battery_id, cycle_index);
 
+CREATE TABLE IF NOT EXISTS analytics.battery_survival_predictions (
+    model_version TEXT NOT NULL, dataset TEXT NOT NULL, battery_id TEXT NOT NULL, cycle_index INTEGER NOT NULL CHECK (cycle_index > 0),
+    horizon_cycles INTEGER NOT NULL CHECK (horizon_cycles >= 0 AND horizon_cycles <= 200), survival_probability DOUBLE PRECISION NOT NULL CHECK (survival_probability >= 0 AND survival_probability <= 1),
+    prediction_created_at TIMESTAMPTZ NOT NULL, split TEXT NOT NULL,
+    PRIMARY KEY (model_version, dataset, battery_id, cycle_index, horizon_cycles)
+);
+CREATE INDEX IF NOT EXISTS battery_survival_predictions_battery_cycle_idx ON analytics.battery_survival_predictions (battery_id, cycle_index DESC);
+
 ALTER TABLE analytics.battery_predictions
     ADD COLUMN IF NOT EXISTS raw_predicted_rul_cycles DOUBLE PRECISION;
 ALTER TABLE analytics.battery_predictions
@@ -84,6 +92,13 @@ CREATE INDEX IF NOT EXISTS battery_cycle_health_latest_idx
 CREATE UNIQUE INDEX IF NOT EXISTS model_evaluations_one_champion_per_dataset_idx
     ON analytics.model_evaluations (dataset) WHERE status = 'champion';
 
+CREATE TABLE IF NOT EXISTS analytics.survival_model_evaluations (
+    model_version TEXT PRIMARY KEY, model_name TEXT NOT NULL, dataset TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('candidate', 'champion', 'retired')),
+    evaluated_at TIMESTAMPTZ NOT NULL, metrics JSONB NOT NULL, training_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    model_fingerprint TEXT UNIQUE, generation TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS survival_model_evaluations_one_champion_per_dataset_idx ON analytics.survival_model_evaluations (dataset) WHERE status = 'champion';
+
 DROP VIEW IF EXISTS analytics.dashboard_battery_latest;
 CREATE VIEW analytics.dashboard_battery_latest AS
 WITH latest_health AS (
@@ -118,3 +133,80 @@ LEFT JOIN analytics.battery_predictions AS prediction
     AND prediction.dataset = health.dataset
     AND prediction.battery_id = health.battery_id
     AND prediction.cycle_index = health.cycle_index;
+
+CREATE TABLE IF NOT EXISTS analytics.current_models (
+    dataset TEXT PRIMARY KEY,
+    model_version TEXT NOT NULL REFERENCES analytics.model_evaluations (model_version),
+    model_fingerprint TEXT,
+    selection_revision INTEGER NOT NULL DEFAULT 1 CHECK (selection_revision > 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE analytics.current_models
+    ADD COLUMN IF NOT EXISTS model_fingerprint TEXT;
+
+CREATE TABLE IF NOT EXISTS analytics.current_survival_models (
+    dataset TEXT PRIMARY KEY,
+    model_version TEXT NOT NULL REFERENCES analytics.survival_model_evaluations (model_version),
+    model_fingerprint TEXT NOT NULL,
+    selection_revision INTEGER NOT NULL DEFAULT 1 CHECK (selection_revision > 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.current_stream_states (
+    dataset TEXT PRIMARY KEY,
+    state_id TEXT NOT NULL,
+    feature_contract_version TEXT NOT NULL,
+    published_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analytics.stream_serving_status (
+    dataset TEXT NOT NULL,
+    state_id TEXT NOT NULL,
+    consumer TEXT NOT NULL CHECK (consumer IN ('rul_current', 'survival_current')),
+    selection_revision INTEGER NOT NULL CHECK (selection_revision >= 0),
+    model_version TEXT,
+    model_fingerprint TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'served', 'unavailable', 'failed')),
+    rows_written INTEGER NOT NULL DEFAULT 0 CHECK (rows_written >= 0),
+    error_message TEXT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (dataset, state_id, consumer, selection_revision)
+);
+CREATE INDEX IF NOT EXISTS stream_serving_status_latest_idx
+    ON analytics.stream_serving_status (dataset, state_id, consumer, selection_revision DESC);
+
+CREATE TABLE IF NOT EXISTS analytics.battery_current_predictions (
+    dataset TEXT NOT NULL,
+    battery_id TEXT NOT NULL,
+    model_version TEXT NOT NULL REFERENCES analytics.model_evaluations (model_version),
+    model_fingerprint TEXT NOT NULL,
+    state_id TEXT NOT NULL,
+    replay_sequence BIGINT NOT NULL CHECK (replay_sequence >= 0),
+    cycle_index INTEGER NOT NULL CHECK (cycle_index > 0),
+    raw_predicted_rul_cycles DOUBLE PRECISION NOT NULL,
+    predicted_rul_cycles DOUBLE PRECISION NOT NULL CHECK (predicted_rul_cycles >= 0),
+    predicted_eol_cycle DOUBLE PRECISION NOT NULL CHECK (predicted_eol_cycle >= cycle_index),
+    inference_created_at TIMESTAMPTZ NOT NULL,
+    selection_revision INTEGER NOT NULL CHECK (selection_revision > 0),
+    PRIMARY KEY (dataset, battery_id)
+);
+CREATE INDEX IF NOT EXISTS battery_current_predictions_dataset_cycle_idx
+    ON analytics.battery_current_predictions (dataset, cycle_index DESC);
+
+CREATE TABLE IF NOT EXISTS analytics.battery_current_survival_predictions (
+    dataset TEXT NOT NULL,
+    battery_id TEXT NOT NULL,
+    cycle_index INTEGER NOT NULL CHECK (cycle_index > 0),
+    horizon_cycles INTEGER NOT NULL CHECK (horizon_cycles >= 0 AND horizon_cycles <= 200),
+    survival_probability DOUBLE PRECISION NOT NULL CHECK (survival_probability >= 0 AND survival_probability <= 1),
+    model_version TEXT NOT NULL REFERENCES analytics.survival_model_evaluations (model_version),
+    model_fingerprint TEXT NOT NULL,
+    state_id TEXT NOT NULL,
+    replay_sequence BIGINT NOT NULL CHECK (replay_sequence >= 0),
+    feature_contract_version TEXT NOT NULL,
+    selection_revision INTEGER NOT NULL CHECK (selection_revision > 0),
+    inference_created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (dataset, battery_id, horizon_cycles)
+);
+CREATE INDEX IF NOT EXISTS battery_current_survival_predictions_dataset_cycle_idx
+    ON analytics.battery_current_survival_predictions (dataset, battery_id, cycle_index DESC);

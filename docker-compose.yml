@@ -58,11 +58,13 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    command: >-
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists
-      --topic battery_measurements --partitions 3 --replication-factor 1 &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists
-      --topic battery_lifecycle --partitions 3 --replication-factor 1
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists
+        --topic battery_measurements --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists
+        --topic battery_lifecycle --partitions 3 --replication-factor 1
 
   spark-master:
     build:
@@ -106,6 +108,7 @@ services:
       - "8082:8081"
 
   spark-submit:
+    profiles: ["jobs"]
     image: battery-reliability-spark:4.1.3
     working_dir: /opt/project
     volumes:
@@ -120,14 +123,20 @@ services:
       - spark-worker-2
 
   spark-stream-submit:
+    profiles: ["jobs"]
     image: battery-reliability-spark:4.1.3
     working_dir: /opt/project
     volumes:
       - ./:/opt/project
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-battery_reliability}
+      POSTGRES_USER: ${POSTGRES_USER:-battery_reliability}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     command: >-
       /opt/spark/bin/spark-submit
       --master spark://spark-master:7077
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3,org.postgresql:postgresql:42.7.7
       /opt/project/src/spark_streaming.py --available-now
     depends_on:
       kafka:
@@ -139,7 +148,36 @@ services:
       spark-worker-2:
         condition: service_started
 
+  survival-serving:
+    build:
+      context: .
+      dockerfile: Dockerfile.survival-serving
+    platform: linux/amd64
+    working_dir: /opt/project
+    volumes:
+      - ./:/opt/project:ro
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-battery_reliability}
+      PGUSER: ${POSTGRES_USER:-battery_reliability}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DATABASE_URL: ""
+    command: ["python", "-m", "src.survival_serving_worker", "--poll-seconds", "30"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  survival-training:
+    build:
+      context: .
+      dockerfile: Dockerfile.survival-training
+    image: battery-reliability-survival-training:1.0
+    platform: linux/amd64
+    profiles: ["training"]
+
   spark-postgres-load:
+    profiles: ["jobs"]
     image: battery-reliability-spark:4.1.3
     working_dir: /opt/project
     volumes:
@@ -172,6 +210,7 @@ services:
     volumes:
       - ./:/opt/project
       - airflow_data:/opt/airflow
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       AIRFLOW_HOME: /opt/airflow
       AIRFLOW__CORE__DAGS_FOLDER: /opt/project/airflow
@@ -181,7 +220,8 @@ services:
       POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-battery_reliability}
       POSTGRES_USER: ${POSTGRES_USER:-battery_reliability}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    command: ["airflow", "standalone"]
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:?Set HOST_PROJECT_ROOT to the absolute checkout path in .env}
+    command: ["sh", "-c", "airflow db migrate && airflow pools set matr_native_training 2 'Shared MATR model training' && exec airflow standalone"]
     ports:
       - "8083:8080"
     depends_on:
@@ -195,7 +235,11 @@ services:
       context: .
       dockerfile: dashboard/Dockerfile
     environment:
-      DATABASE_URL: postgresql://analytics_dashboard:${DASHBOARD_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}@postgres:5432/${POSTGRES_DB:-battery_reliability}
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-battery_reliability}
+      PGUSER: analytics_dashboard
+      PGPASSWORD: ${DASHBOARD_POSTGRES_PASSWORD:?Set DASHBOARD_POSTGRES_PASSWORD in .env}
+      DATABASE_URL: ""
     ports:
       - "127.0.0.1:8501:8501"
     depends_on:

@@ -8,4 +8,5 @@ RUN airflow_python_version="$(python3 -c 'import sys; print(f"{sys.version_info.
     && python3 -m pip install --no-cache-dir \
         "apache-airflow==${AIRFLOW_VERSION}" \
         "apache-airflow-providers-standard" \
+        "apache-airflow-providers-docker" \
         --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${airflow_python_version}.txt"

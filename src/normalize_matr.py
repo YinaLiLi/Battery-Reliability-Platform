@@ -1,10 +1,22 @@
 """CLI for the official BatteryLife MATR processed archive."""
 
 import argparse
-import subprocess
+import zipfile
 from pathlib import Path
 
-from matr_data import normalize_archive
+try:
+    from .matr_data import normalize_archive
+except ImportError:
+    from matr_data import normalize_archive
+
+
+def extract_archive(archive):
+    with zipfile.ZipFile(archive) as source:
+        destination = archive.parent.resolve()
+        for member in source.infolist():
+            if not (destination / member.filename).resolve().is_relative_to(destination):
+                raise ValueError('Archive contains a path outside its destination')
+        source.extractall(destination)
 
 
 def main():
@@ -15,7 +27,7 @@ def main():
     args = parser.parse_args()
     raw_dir = args.archive.with_suffix("")
     if not raw_dir.exists():
-        subprocess.run(["unzip", "-oq", str(args.archive), "-d", str(raw_dir.parent)], check=True)
+        extract_archive(args.archive)
     print(normalize_archive(raw_dir, args.labels, args.output))
 
 

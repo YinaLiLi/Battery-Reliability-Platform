@@ -1,0 +1,88 @@
+name: Compatibility
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ['3.10', '3.11', '3.12', '3.13']
+        include:
+          - {os: windows-latest, python: '3.10'}
+          - {os: windows-latest, python: '3.13'}
+          - {os: macos-latest, python: '3.10'}
+          - {os: macos-latest, python: '3.13'}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - if: runner.os == 'macOS'
+        run: brew install libomp
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/preflight.py --profile unit --tracked --json > preflight.json
+      - run: python -m pytest --tier unit -q
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-${{ matrix.os }}-${{ matrix.python }}
+          path: preflight.json
+  runtimes:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: python -m pip install -r requirements.txt -r requirements.survival-serving.txt -r requirements.survival-training.txt
+      - run: python -m pip check
+      - run: python scripts/preflight.py --profile spark --json > spark.json
+      - run: python -m pytest --tier spark -q
+      - run: python scripts/preflight.py --profile survival --json > survival.json
+      - run: python -m pytest --tier survival -q
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtimes-${{ matrix.python }}
+          path: '*.json'
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      POSTGRES_PASSWORD: ci-only-database-password
+      DASHBOARD_POSTGRES_PASSWORD: ci-only-dashboard-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: echo "HOST_PROJECT_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+      - run: python scripts/preflight.py --profile compose --tracked --json > preflight.json
+      - run: docker compose build spark-master
+      - run: docker compose --profile training build airflow dashboard survival-serving survival-training
+      - run: docker compose up -d postgres kafka
+      - run: docker compose run --rm postgres-init
+      - run: docker compose run --rm topic-init
+      - run: docker compose run --rm --no-deps spark-submit /opt/spark/bin/spark-submit --master 'local[1]' scripts/spark_smoke.py
+      - run: docker compose run --rm --no-deps survival-training python -c "import sksurv, sklearn; assert sksurv.__version__ == '0.24.1'; assert sklearn.__version__ == '1.6.1'"
+      - run: docker compose run --rm --no-deps survival-serving python -c "import src.survival_serving_worker; import sksurv; assert sksurv.__version__ == '0.24.1'"
+      - run: docker compose run --rm --no-deps airflow python3 -m pytest --tier airflow -q
+      - run: docker compose up -d dashboard
+      - run: python -m pip install pytest
+      - run: python -m pytest --tier integration -q
+      - if: always()
+        run: docker compose down --volumes --remove-orphans
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-preflight
+          path: preflight.json

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pyarrow.dataset as ds
@@ -50,12 +51,27 @@ def scheduled_replay_events(measurements, manifest, *, include_lifecycle=True):
     """Schedule telemetry and independent lifecycle facts in one stable replay order."""
     by_battery = {row["battery_id"]: row for row in manifest}
     events = []
+    completed_cycles = {}
     for row in measurements:
-        events.append((0, schedule_measurement(row, by_battery[row["battery_id"]], replay_sequence=0)))
+        scheduled = schedule_measurement(row, by_battery[row["battery_id"]], replay_sequence=0)
+        events.append((0, scheduled))
+        key = (scheduled["battery_id"], scheduled["cycle_index"])
+        if key not in completed_cycles or scheduled["replay_event_time"] > completed_cycles[key]["replay_event_time"]:
+            completed_cycles[key] = scheduled
+    for scheduled in completed_cycles.values():
+        events.append((1, {
+            "event_id": f"matr-lifecycle:{scheduled['battery_id']}:cycle_complete:{scheduled['cycle_index']}",
+            "event_type": "cycle_complete",
+            "dataset": scheduled["dataset"],
+            "battery_id": scheduled["battery_id"],
+            "cycle_index": scheduled["cycle_index"],
+            "replay_event_time": scheduled["replay_event_time"],
+            "schema_version": "1.0",
+        }))
     if include_lifecycle:
         for manifest_row in manifest:
             for lifecycle in lifecycle_events_for_manifest(manifest_row):
-                events.append((1 if lifecycle["event_type"] == "eol_observed" else 2, lifecycle))
+                events.append((2 if lifecycle["event_type"] == "eol_observed" else 3, lifecycle))
     for sequence, (_, event) in enumerate(sorted(events, key=lambda item: (item[1]["replay_event_time"], item[0], item[1]["battery_id"], item[1].get("cycle_index", 0), item[1].get("sample_index", 0)))):
         yield {**event, "replay_sequence": sequence}
 
@@ -94,7 +110,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Replay MATR measurements to Kafka.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument("--bootstrap-server", default="localhost:9092")
+    parser.add_argument("--bootstrap-server", default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     parser.add_argument("--limit", type=int, default=0, help="Rows to send; 0 sends all rows.")
     parser.add_argument("--battery-id", action="append", dest="battery_ids", help="Restrict bounded verification replay to one or more batteries.")
     parser.add_argument("--limit-per-battery", type=int, default=0, help="Maximum events per selected battery; 0 disables the per-battery bound.")
@@ -106,7 +122,7 @@ def main():
     if args.limit < 0:
         raise SystemExit("--limit must be zero or positive")
     if Producer is None:
-        raise SystemExit("Install dependencies first: .venv/bin/pip install -r requirements.txt")
+        raise SystemExit("Install dependencies first: python -m pip install -r requirements.txt")
 
     producer = Producer(
         {

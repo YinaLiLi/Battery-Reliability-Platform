@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 
 try:
     from confluent_kafka import Consumer
@@ -39,7 +40,7 @@ def consume_messages(consumer, max_messages=1000, output=print):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Print battery measurements from Kafka.")
-    parser.add_argument("--bootstrap-server", default="localhost:9092")
+    parser.add_argument("--bootstrap-server", default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     parser.add_argument("--max-messages", type=int, default=1000, help="Messages to print; 0 runs indefinitely.")
     return parser.parse_args()
 
@@ -49,7 +50,7 @@ def main():
     if args.max_messages < 0:
         raise SystemExit("--max-messages must be zero or positive")
     if Consumer is None:
-        raise SystemExit("Install dependencies first: .venv/bin/pip install -r requirements.txt")
+        raise SystemExit("Install dependencies first: python -m pip install -r requirements.txt")
 
     consumer = Consumer(
         {

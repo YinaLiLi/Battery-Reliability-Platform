@@ -1,0 +1,10 @@
+# Spark/RUL image: Survival executes in its separate pinned amd64 runtime.
+numpy==2.2.6
+pyarrow==22.0.0
+pyspark==4.1.3
+pytest==9.0.2
+scipy==1.15.3
+scikit-learn==1.6.1
+xgboost==2.1.4
+joblib==1.5.3
+pandas>=2.2,<3.1

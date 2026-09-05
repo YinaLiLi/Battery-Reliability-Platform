@@ -101,12 +101,12 @@ def test_scheduled_replay_interleaves_batteries_and_emits_separate_lifecycle_eve
     replay = list(scheduled_replay_events(measurements, manifest))
 
     assert [(row.get("event_type"), row["battery_id"], row["replay_sequence"]) for row in replay] == [
-        (None, "early", 0), ("replay_complete", "early", 1),
-        (None, "late", 2), ("eol_observed", "late", 3), ("replay_complete", "late", 4),
+        (None, "early", 0), ("cycle_complete", "early", 1), ("replay_complete", "early", 2),
+        (None, "late", 3), ("cycle_complete", "late", 4), ("eol_observed", "late", 5), ("replay_complete", "late", 6),
     ]
     producer = FakeProducer()
-    assert produce_rows(replay, producer, limit=0) == 5
-    assert [record["topic"] for record in producer.produced].count(LIFECYCLE_TOPIC) == 3
+    assert produce_rows(replay, producer, limit=0) == 7
+    assert [record["topic"] for record in producer.produced].count(LIFECYCLE_TOPIC) == 5
 
 
 def test_bounded_telemetry_rows_uses_battery_filter_before_reading_rows(tmp_path):

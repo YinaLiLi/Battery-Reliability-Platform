@@ -1,65 +1,138 @@
 # Battery Reliability Platform
 
-An end-to-end battery reliability platform built on BatteryLife MATR historical aging data. It processes 130,573,638 laboratory measurement rows from 169 batteries across 140,001 cycles with PySpark, supports deterministic simulated replay and Spark Structured Streaming battery-health state, selects an RUL regression model at each training snapshot, and serves health and model monitoring through PostgreSQL and Streamlit.
+An end-to-end battery-health platform for the BatteryLife MATR dataset. It turns canonical telemetry into deterministic progressive-arrival Kafka replay, maintains a time-consistent Spark state, trains independent RUL and conditional-survival models, and serves operational results through PostgreSQL-backed Streamlit monitoring.
 
-The platform is designed for battery reliability monitoring and predictive maintenance. SOH is a measured/derived health metric, while RUL is the ML-predicted number of cycles remaining.
+## Results at a Glance
 
-SOH is a deterministic measured health metric, not an ML target:
+The canonical MATR corpus contains 169 batteries, 140,001 cycles, and 130,573,638 measurements. Canonical v3 generations use the shared arrived-battery cohort and fixed offline benchmark.
 
-`soh = discharge_capacity_in_Ah / nominal_capacity_in_Ah / SOC_width`
+### RUL fixed-test results
 
-The current discharge-capacity signal reconstructs this value directly in MATR. The only ML target is remaining useful life (RUL) in cycles.
+| Generation | Selected family | Arrived cohort | MAE (cycles) | RMSE (cycles) | R² |
+|---|---:|---:|---:|---:|---:|
+| 1.0 | MLP | 26 | 98.04 | 150.27 | 0.6684 |
+| 1.1 | XGBoost | 51 | 46.71 | 71.77 | 0.9244 |
+| 1.2 | XGBoost | 76 | 40.91 | 63.85 | 0.9401 |
+| 1.3 | XGBoost | 94 | 39.41 | 62.59 | 0.9425 |
+
+### Survival fixed-test results
+
+| Generation | Selected family | Arrived cohort | Integrated Brier ↓ | IPCW C-index ↑ |
+|---|---:|---:|---:|---:|
+| 1.0 | RSF | 26 | 0.02397 | 0.8372 |
+| 1.1 | RSF | 51 | 0.02101 | 0.7923 |
+| 1.2 | RSF | 76 | 0.01929 | 0.8199 |
+| 1.3 | RSF | 94 | 0.01966 | 0.8349 |
+
+MAE/RMSE and integrated Brier are lower-is-better; R² and IPCW C-index are higher-is-better. Family/configuration selection is validation-only; the fixed test benchmark is evaluated only for the selected winner.
 
 ## Architecture
 
-`MATR.zip → canonical Parquet → PySpark causal degradation features → RUL model selection/evaluation/predictions → PostgreSQL → Streamlit`
+```mermaid
+flowchart TD
+    subgraph DATA["DATA"]
+        DSET["Dataset<br/>(BatteryLife MATR)"] --> PARQ["Canonical Parquet"]
+        PARQ --> REPLAY["Deterministic Progressive Replay"]
+        REPLAY --> KAFKA["Kafka"]
+    end
 
-`arrival manifest + deterministic staggered replay → Kafka battery_measurements → Structured Streaming cycle health → PostgreSQL`
+    subgraph STREAM["STREAMING & STATE"]
+        SPARK["ARM Spark Structured Streaming"] --> FINAL["Finalized Cycle Boundary<br/>Causal Feature State"]
+        FINAL --> MANIFEST["Immutable State Manifest<br/>Kafka Lineage"]
+    end
 
-Airflow orchestrates the batch path:
+    subgraph TRAIN["CONTINUOUS TRAINING"]
+        AIRFLOW["Airflow"] --> SHARED["Shared State-Bound Features<br/>built once"]
+        SHARED --> RULTRAIN["RUL Training"]
+        SHARED --> SURVTRAIN["Survival Training"]
+        RULTRAIN --> CANDIDATES["Immutable Candidate Models"]
+        SURVTRAIN --> CANDIDATES
+    end
 
-`ingest_matr → normalize_matr → build_degradation_features → train_evaluate_models → publish_predictions → load_serving_tables`
+    subgraph SERVE["CURRENT SERVING"]
+        RULMODEL["Current RUL Model<br/>Spark runtime"] --> PG["PostgreSQL"]
+        SURVMODEL["Current Survival Model<br/>linux/amd64 worker"] --> PG
+        PG --> DASH["Streamlit Battery Monitoring"]
+    end
 
-Continuous arrival and retraining adds:
+    KAFKA --> SPARK
+    FINAL --> AIRFLOW
+    FINAL --> RULMODEL
+    FINAL --> SURVMODEL
+    BENCH["Immutable Fixed Benchmark"] -. "validation / evaluation only" .-> RULTRAIN
+    BENCH -. "validation / evaluation only" .-> SURVTRAIN
+```
 
-- deterministic, staggered battery start-time simulation from `arrival_manifest.parquet`
-- deterministic `replay_complete` / `eol_observed` lifecycle events
-- training eligibility based only on valid observed endpoints
-- threshold-driven cumulative training snapshots `26 → 51 → 76 → 94` with fixed split cohorts
-- candidate-only `matr_continuous_retraining` refresh when a threshold is crossed
-- idempotent refresh behavior when the same snapshot is reached again
+`latest.json` is an internal handoff for the latest finalized state. PostgreSQL is the serving boundary: Streamlit does not read manifests, state artifacts, Parquet, or model files directly.
 
-Kafka replays historical measurements deterministically; it is not real-time field telemetry.
+## Data & Deterministic Replay
 
-## Data and artifacts
+- The normalization step converts the source MATR archive to canonical Parquet.
+- A deterministic progressive-arrival schedule orders batteries without using labels; generation snapshots occur when the arrived cohort reaches 26, 51, 76, or 94 batteries.
+- The replay producer publishes telemetry before each matching `cycle_complete`, then lifecycle completion events. Kafka idempotence is enabled.
+- Structured Streaming consumes `battery_measurements` and `battery_lifecycle`, deduplicates events, and preserves source topic/partition/offset watermarks.
 
-The verified official archive is `data/raw/batterylife/MATR.zip`. Canonical outputs under `data/processed/matr/` contain 169 batteries, 140,001 cycles, and 130,573,638 measurement rows.
+## Time-Consistent State
 
-- Parquet is canonical historical storage.
-- PySpark builds causal degradation features over roughly 130M measurements.
-- Kafka provides deterministic historical replay keyed by `battery_id`.
-- Spark Structured Streaming materializes deduplicated battery/cycle health state.
-- Measured discharge capacity produces SOH; the validation-selected model predicts RUL.
-- Airflow orchestrates batch feature engineering and model-refresh workflows.
-- PostgreSQL serves compact health, prediction, replay-window, and evaluation snapshots to the dashboard.
-- Streamlit provides battery reliability and model monitoring views.
+Only cycles with an observed matching `cycle_complete` enter the immutable finalized boundary. The same boundary feeds as-of cycle state and features; future cycles cannot enter operational features or training. The immutable manifest is published after those artifacts are durable and records canonical replay fingerprints plus Kafka lineage.
 
-The frozen lineage-disjoint benchmark cohorts are under `data/processed/matr/` and use fixed validation/test IDs across all generations.
+One shared feature contract owns aggregation, causal history windows, feature ordering, null handling, and imputation semantics. Streaming and PySpark historical processing use the same calculations, including the preceding-nine-cycle windows and `capacity_slope_10`.
 
-Continuous generations are neutral snapshots: `Model 1.0`, `Model 1.1`, `Model 1.2`, and `Model 1.3` correspond to 26, 51, 76, and 94 training batteries. Each trains Ridge, Random Forest, XGBoost, and MLP candidates using the fixed validation cohort, selects by validation MAE (then RMSE and fixed family order), and evaluates only the winner on the fixed test cohort.
+## Modeling & Experiment Design
 
-Legacy full-pool generations are retained in PostgreSQL as retired audit rows.
+`SOH` is discharge capacity normalized to the MATR nominal-capacity convention (1.1 Ah; source normalization also accounts for the SOC width). The source-supported EOL is approximately 80% SOH. RUL is remaining cycles to EOL.
 
-Operational serving always enforces non-negative RUL and irreversible EOL behavior (first predicted EOL is frozen) before serving.
+RUL trains Ridge, Random Forest, XGBoost, and MLP candidates from manifest-bound train features and observable supervised EOL labels. Survival trains Cox proportional hazards and Random Survival Forest models from event/right-censored histories; training uses the accepted stride-10 landmark sampling while validation and test retain their complete evaluation semantics.
 
-## Local services
+The immutable fixed offline benchmark contains 34 validation batteries (29,718 complete rows) and 34 test batteries (24,709 complete rows), with lineage memberships, labels, split metadata, and content hashes. It is never used for training, streaming inference, or generation-cutoff filtering.
 
-Create a local `.env` from `.env.example`, then start the retained Docker services with `docker compose up -d`. The database is `battery_reliability`; its password belongs only in the ignored `.env`.
+Older shared-state snapshots, the stale linear retraining DAG, legacy ARM Survival orchestration, and mutable latest-candidate pointers remain audit/test material, not canonical production flow.
 
-The primary batch DAG (`matr_reliability_pipeline`) reuses canonical MATR outputs and does not manage Kafka or the long-running streaming job. The continuous retraining DAG (`matr_continuous_retraining`) is conditional and no longer auto-promotes: it creates candidate generations only when thresholds are crossed and requires a manual champion promotion action.
+## Continuous Training
 
-Task-level `airflow dags test` verification has been used for both DAGs; the standalone local scheduler has experienced memory/OOM pressure and is not production-scheduler verification.
+Airflow runs the shared-generation DAG:
 
-## Focused checks
+```text
+validate shared state/receipt
+  → build manifest-bound historical features once
+  → parallel RUL training/evaluation  ||  parallel Survival training/evaluation
+  → independent candidate publish/load
+```
 
-Run the focused suite with `pytest -q tests/test_matr_data.py tests/test_matr_stage2.py tests/test_battery_events.py tests/test_kafka_streaming.py tests/test_spark_streaming.py tests/test_postgres_loader.py tests/test_airflow_dag.py`. Spark tests require Java and the project Python environment. Validate Compose with `docker compose config`.
+Both branches use the same state cutoff and arrived cohort. Expensive state-bound preprocessing runs once before fan-out. Each branch writes its own immutable generation artifacts; a failed branch does not delete or roll back a successful sibling. Native model workers and the amd64 Survival container are pool/CPU limited to avoid oversubscription. Candidate publication never changes either manually selected Current Model.
+
+## Serving & Monitoring
+
+- `analytics.current_models` and `analytics.current_survival_models` are independent dataset-scoped selections.
+- Spark current RUL inference and the amd64 `survival-serving` worker score only the newest finalized cycle for each eligible non-benchmark battery.
+- Current predictions are monotonic upserts into PostgreSQL; state and selection ordering prevent stale overwrites.
+- RUL retains raw predictions, serves nonnegative constrained RUL, and enforces irreversible/frozen predicted EOL. Survival serves the 0–200 cycle grid with `S(0)=1`, finite bounded non-increasing probabilities, and exact +50/+100/+200 horizons.
+- PostgreSQL serving-status tables expose finalized-state availability and RUL/Survival health. Streamlit Battery Detail shows operational Survival only when the current state and selected model match a served status; there is no candidate-artifact fallback.
+- Immutable candidate/history predictions remain available for comparison and audit.
+
+## Running the Project
+
+The unified project environment is **Python >=3.10,<3.14, Java >=17, a Docker
+Compose CLI >=2.0 with the required Compose Specification capabilities, and Linux containers**. Use Docker Desktop on macOS and Docker Desktop
+with WSL2 on Windows. Follow [the clean-clone setup and test commands](docs/environment.md)
+before starting services. Desktop full-stack verification remains a manual release
+gate; the CI matrix defines the automated evidence, not a claim that it has already run.
+
+```sh
+python scripts/preflight.py --profile compose
+```
+
+Profiles select checks; every profile enforces the same project Python range.
+
+1. Install the Python development requirements and configure `.env` from the supplied example.
+2. Validate the compose graph with `docker compose config` and start the platform with `docker compose up -d`.
+3. Normalize MATR data, create the deterministic arrival manifest, and publish the bounded replay with the repository scripts under `src/`.
+4. Start `spark-stream-submit` for the available-now Structured Streaming run. Inspect finalized artifacts and PostgreSQL serving/status tables.
+5. Trigger `matr_shared_generation_retraining` from Airflow for a recorded generation receipt. The Survival training/serving images run as `linux/amd64`; the Spark image remains ARM and does not import scikit-survival.
+6. Open Streamlit at the dashboard service port. Dashboard runtime reads are PostgreSQL-only.
+
+Focused verification is available with the repository test suite, including feature-contract parity, stream-state lineage, serving monotonicity, worker behavior, and DAG/receipt idempotency tests.
+
+## Scope & Limitations
+
+This is a reproducible MATR laboratory platform, not a live field-telemetry deployment. Kafka replay is deterministic and simulated; the current stream state is an operational snapshot, not a guarantee of production field coverage. Results depend on the fixed cohort, feature contract, and benchmark definitions above. The canonical scope includes RUL plus conditional survival (Cox PH and Random Survival Forest), with parallel training, PostgreSQL serving, an amd64 Survival worker, and Streamlit monitoring.

@@ -1,4 +1,8 @@
 certifi==2026.7.22
+# Official interpreter range: >=3.10,<3.14. Pins preserve model reproducibility.
+pandas>=2.2,<3.1
+joblib==1.5.3
+psycopg[binary]>=3.2,<4
 charset-normalizer==3.5.1
 confluent-kafka==2.13.2
 idna==3.19
@@ -9,5 +13,6 @@ pytest==9.0.2
 requests==2.34.2
 scipy==1.15.3
 scikit-learn==1.6.1
+scikit-survival==0.24.1
 urllib3==2.7.0
 xgboost==2.1.4

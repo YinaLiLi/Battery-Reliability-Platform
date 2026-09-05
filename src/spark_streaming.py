@@ -1,16 +1,38 @@
 """Aggregate Kafka telemetry with PySpark Structured Streaming."""
 
 import argparse
+import json
+import os
+import re
 from pathlib import Path
 
 from pyspark.sql import SparkSession, functions as F, types as T
+try:
+    from .stream_runtime import publish_state_artifacts, publish_latest_manifest
+    from .stream_state import build_finalized_cycle_boundary, state_id_for_boundary
+    from .train_matr_models import FEATURE_VERSION
+    from .feature_contract import RUL_FEATURES, feature_rows, render_spark_cycle_aggregate, spark_cycle_aggregate_expressions
+    from .stream_inference import current_prediction_rows
+    from .serving_status import current_stream_state_row, serving_status_row
+    from .postgres_loader import build_current_prediction_upsert_sql, build_current_stream_state_upsert_sql, build_serving_status_upsert_sql, _execute, jdbc_properties
+except ImportError:
+    from stream_runtime import publish_state_artifacts, publish_latest_manifest
+    from stream_state import build_finalized_cycle_boundary, state_id_for_boundary
+    from train_matr_models import FEATURE_VERSION
+    from feature_contract import RUL_FEATURES, feature_rows, render_spark_cycle_aggregate, spark_cycle_aggregate_expressions
+    from stream_inference import current_prediction_rows
+    from serving_status import current_stream_state_row, serving_status_row
+    from postgres_loader import build_current_prediction_upsert_sql, build_current_stream_state_upsert_sql, build_serving_status_upsert_sql, _execute, jdbc_properties
 
 
-DEFAULT_MASTER = "spark://spark-master:7077"
-DEFAULT_BOOTSTRAP_SERVER = "kafka:29092"
+DEFAULT_MASTER = os.environ.get("SPARK_MASTER", "local[*]")
+DEFAULT_BOOTSTRAP_SERVER = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 DEFAULT_OUTPUT_PATH = Path("data/processed/matr/replay_cycle_health")
 DEFAULT_CHECKPOINT_PATH = Path("data/processed/matr/replay_checkpoint")
 DEFAULT_LIFECYCLE_OUTPUT_PATH = Path("data/processed/matr/replay_lifecycle_state")
+DEFAULT_COMPLETED_CYCLES_PATH = Path("data/processed/matr/replay_completed_cycles")
+DEFAULT_KAFKA_OFFSETS_PATH = Path("data/processed/matr/replay_kafka_offsets")
+DEFAULT_STATE_ROOT = Path("data/processed/matr")
 TOPIC = "battery_measurements"
 LIFECYCLE_TOPIC = "battery_lifecycle"
 SHUFFLE_PARTITIONS = 3
@@ -48,8 +70,48 @@ LIFECYCLE_SCHEMA = T.StructType([
     T.StructField("schema_version", T.StringType()),
 ])
 
+CURRENT_STREAM_STATE_SCHEMA = T.StructType([
+    T.StructField("dataset", T.StringType(), False),
+    T.StructField("state_id", T.StringType(), False),
+    T.StructField("feature_contract_version", T.StringType(), False),
+    T.StructField("published_at", T.StringType(), False),
+])
+
+SERVING_STATUS_SCHEMA = T.StructType([
+    T.StructField("dataset", T.StringType(), False),
+    T.StructField("state_id", T.StringType(), False),
+    T.StructField("consumer", T.StringType(), False),
+    T.StructField("selection_revision", T.IntegerType(), False),
+    T.StructField("model_version", T.StringType(), True),
+    T.StructField("model_fingerprint", T.StringType(), True),
+    T.StructField("status", T.StringType(), False),
+    T.StructField("rows_written", T.IntegerType(), False),
+    T.StructField("error_message", T.StringType(), True),
+    T.StructField("updated_at", T.StringType(), False),
+])
+
+CURRENT_PREDICTION_SCHEMA = T.StructType([
+    T.StructField("dataset", T.StringType(), False),
+    T.StructField("battery_id", T.StringType(), False),
+    T.StructField("model_version", T.StringType(), False),
+    T.StructField("model_fingerprint", T.StringType(), False),
+    T.StructField("state_id", T.StringType(), False),
+    T.StructField("replay_sequence", T.LongType(), False),
+    T.StructField("cycle_index", T.IntegerType(), False),
+    T.StructField("raw_predicted_rul_cycles", T.DoubleType(), False),
+    T.StructField("predicted_rul_cycles", T.DoubleType(), False),
+    T.StructField("predicted_eol_cycle", T.DoubleType(), False),
+    T.StructField("inference_created_at", T.StringType(), False),
+    T.StructField("selection_revision", T.IntegerType(), False),
+])
+
 
 def build_spark_session(master=DEFAULT_MASTER):
+    try:
+        from .spark_environment import configure_local_python
+    except ImportError:
+        from spark_environment import configure_local_python
+    configure_local_python(master)
     """Create the small cluster session used by the streaming job."""
     return (
         SparkSession.builder.master(master)
@@ -63,13 +125,19 @@ def build_spark_session(master=DEFAULT_MASTER):
     )
 
 
+def _payload_with_kafka_metadata(kafka_records, schema):
+    metadata = []
+    for column, dtype in (("topic", "string"), ("partition", "int"), ("offset", "long")):
+        metadata.append(F.col(column) if column in kafka_records.columns else F.lit(None).cast(dtype).alias(column))
+    return kafka_records.select(F.from_json(F.col("value").cast("string"), schema).alias("payload"), *metadata)
+
+
 def parse_telemetry(kafka_records):
     """Decode valid Kafka JSON telemetry and normalize its event time to UTC."""
-    payload = F.from_json(F.col("value").cast("string"), TELEMETRY_SCHEMA)
     return (
-        kafka_records.select(payload.alias("payload"))
+        _payload_with_kafka_metadata(kafka_records, TELEMETRY_SCHEMA)
         .where(F.col("payload").isNotNull())
-        .select("payload.*")
+        .select("payload.*", "topic", "partition", "offset")
         .withColumn("event_time", F.to_timestamp("replay_event_time"))
         .where(F.col("event_id").isNotNull() & F.col("dataset").isNotNull() & F.col("battery_id").isNotNull() & F.col("cycle_index").isNotNull() & F.col("sample_index").isNotNull() & F.col("event_time").isNotNull() & (F.col("schema_version") == "1.0"))
     )
@@ -77,13 +145,12 @@ def parse_telemetry(kafka_records):
 
 def parse_lifecycle(kafka_records):
     """Decode the immutable EOL and replay-completion facts."""
-    payload = F.from_json(F.col("value").cast("string"), LIFECYCLE_SCHEMA)
     return (
-        kafka_records.select(payload.alias("payload"))
+        _payload_with_kafka_metadata(kafka_records, LIFECYCLE_SCHEMA)
         .where(F.col("payload").isNotNull())
-        .select("payload.*")
+        .select("payload.*", "topic", "partition", "offset")
         .withColumn("event_time", F.to_timestamp("replay_event_time"))
-        .where(F.col("event_id").isNotNull() & F.col("battery_id").isNotNull() & F.col("event_time").isNotNull() & F.col("event_type").isin("eol_observed", "replay_complete") & (F.col("schema_version") == "1.0"))
+        .where(F.col("event_id").isNotNull() & F.col("battery_id").isNotNull() & F.col("event_time").isNotNull() & F.col("event_type").isin("cycle_complete", "eol_observed", "replay_complete") & (F.col("schema_version") == "1.0"))
     )
 
 
@@ -96,25 +163,11 @@ def deduplicate_events(telemetry):
 
 def _cycle_health_aggregates(telemetry):
     """Return additive aggregates so a micro-batch can be merged by cycle key."""
-    def optional_maximum(column):
-        return F.max(column) if column in telemetry.columns else F.lit(None).cast("double")
-
-    return telemetry.groupBy("battery_id", "cycle_index").agg(
-        F.count("*").alias("event_count"),
-        F.sum("voltage_in_V").alias("_voltage_sum"),
-        F.count("voltage_in_V").alias("_voltage_count"),
-        optional_maximum("temperature_in_C").alias("maximum_temperature_in_C"),
-        optional_maximum("charge_capacity_in_Ah").alias("charge_capacity_in_Ah"),
-        optional_maximum("discharge_capacity_in_Ah").alias("discharge_capacity_in_Ah"),
-        optional_maximum("internal_resistance_in_ohm").alias("internal_resistance_in_ohm"),
-    )
+    return telemetry.groupBy("battery_id", "cycle_index").agg(*spark_cycle_aggregate_expressions(F, telemetry.columns))
 
 
 def _render_cycle_health(aggregates):
-    return aggregates.withColumn(
-        "average_voltage_in_V",
-        F.when(F.col("_voltage_count") > 0, F.col("_voltage_sum") / F.col("_voltage_count")),
-    )
+    return render_spark_cycle_aggregate(aggregates, F)
 
 
 def build_window_metrics(telemetry):
@@ -132,6 +185,13 @@ def build_lifecycle_state(lifecycle):
     )
 
 
+def finalized_cycle_boundary(lifecycle):
+    """Return only explicitly completed cycles; no timestamp reconstruction is allowed."""
+    return deduplicate_events(lifecycle).where(F.col("event_type") == "cycle_complete").select(
+        "dataset", "battery_id", "cycle_index", "replay_sequence", "event_time", "topic", "partition", "offset"
+    ).dropDuplicates(["dataset", "battery_id", "cycle_index"])
+
+
 def upsert_cycle_health(batch, _batch_id, output_path):
     """Merge a micro-batch into canonical Parquet by (battery_id, cycle_index)."""
     if batch.rdd.isEmpty():
@@ -142,12 +202,13 @@ def upsert_cycle_health(batch, _batch_id, output_path):
         incoming = incoming.unionByName(batch.sparkSession.read.parquet(str(output_path)), allowMissingColumns=True)
     merged = incoming.groupBy("battery_id", "cycle_index").agg(
         F.sum("event_count").alias("event_count"),
-        F.sum("_voltage_sum").alias("_voltage_sum"),
-        F.sum("_voltage_count").alias("_voltage_count"),
-        F.max("maximum_temperature_in_C").alias("maximum_temperature_in_C"),
-        F.max("charge_capacity_in_Ah").alias("charge_capacity_in_Ah"),
-        F.max("discharge_capacity_in_Ah").alias("discharge_capacity_in_Ah"),
-        F.max("internal_resistance_in_ohm").alias("internal_resistance_in_ohm"),
+        F.sum("_voltage_sum").alias("_voltage_sum"), F.sum("_voltage_count").alias("_voltage_count"),
+        F.sum("_current_sum").alias("_current_sum"), F.sum("_current_count").alias("_current_count"),
+        F.max("charge_time_in_s").alias("charge_time_in_s"), F.max("charge_capacity_in_Ah").alias("charge_capacity_in_Ah"),
+        F.max("discharge_capacity_in_Ah").alias("discharge_capacity_in_Ah"), F.max("internal_resistance_in_ohm").alias("internal_resistance_in_ohm"),
+        F.min("temperature_min_in_C").alias("temperature_min_in_C"), F.min("voltage_min_in_V").alias("voltage_min_in_V"),
+        F.max("temperature_max_in_C").alias("temperature_max_in_C"), F.max("voltage_max_in_V").alias("voltage_max_in_V"),
+        F.max("current_abs_max_in_A").alias("current_abs_max_in_A"),
     )
     health = _render_cycle_health(merged).cache()
     try:
@@ -175,7 +236,140 @@ def upsert_lifecycle_state(batch, _batch_id, output_path):
     state.write.mode("overwrite").parquet(str(output_path))
 
 
-def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAULT_LIFECYCLE_OUTPUT_PATH, available_now=False):
+def upsert_completed_cycles(batch, output_path):
+    """Persist only explicit cycle completion facts for the authoritative boundary."""
+    incoming = finalized_cycle_boundary(batch)
+    if incoming.rdd.isEmpty():
+        return
+    output_path = Path(output_path)
+    if output_path.exists():
+        incoming = incoming.unionByName(batch.sparkSession.read.parquet(str(output_path)))
+    incoming.dropDuplicates(["dataset", "battery_id", "cycle_index"]).write.mode("overwrite").parquet(str(output_path))
+
+
+def upsert_kafka_offset_watermarks(batch, output_path):
+    """Persist inclusive source offsets independently of mutable Spark checkpoints."""
+    incoming = batch.select("topic", "partition", "offset").where(
+        F.col("topic").isin(TOPIC, LIFECYCLE_TOPIC) & F.col("partition").isNotNull() & F.col("offset").isNotNull()
+    ).groupBy("topic", "partition").agg(F.max("offset").alias("offset"))
+    if incoming.rdd.isEmpty():
+        return
+    output_path = Path(output_path)
+    if output_path.exists():
+        incoming = incoming.unionByName(batch.sparkSession.read.parquet(str(output_path)))
+    incoming.groupBy("topic", "partition").agg(F.max("offset").alias("offset")).write.mode("overwrite").parquet(str(output_path))
+
+
+def kafka_offset_watermarks(spark, path):
+    """Return canonical inclusive high-watermarks by Kafka topic and partition."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    result = {}
+    for row in spark.read.parquet(str(path)).orderBy("topic", "partition").collect():
+        result.setdefault(row.topic, {})[str(int(row.partition))] = int(row.offset)
+    return result
+
+
+def publish_completed_state(spark, *, health_path, completed_cycles_path, offset_watermarks_path, state_root, canonical_fingerprint, arrival_manifest_fingerprint, lifecycle_path, batch_id):
+    """Publish state only after both the accumulated health and completion boundary exist."""
+    if not Path(health_path).exists() or not Path(completed_cycles_path).exists():
+        return None
+    completed = spark.read.parquet(str(completed_cycles_path)).orderBy("dataset", "battery_id", "cycle_index")
+    keys = [{"dataset": row.dataset, "battery_id": row.battery_id, "cycle_index": int(row.cycle_index)} for row in completed.collect()]
+    if not keys:
+        return None
+    boundary = build_finalized_cycle_boundary(keys, canonical_fingerprint=canonical_fingerprint,
+        arrival_manifest_fingerprint=arrival_manifest_fingerprint, feature_contract_version=FEATURE_VERSION)
+    state_id = state_id_for_boundary(boundary)
+    if (Path(state_root) / "stream_state" / state_id / "manifest.json").exists():
+        return None
+    kafka_offsets = kafka_offset_watermarks(spark, offset_watermarks_path)
+    if not kafka_offsets:
+        raise RuntimeError("Kafka-produced finalized state requires source offset watermarks")
+    if not {"topic", "partition", "offset"}.issubset(completed.columns):
+        raise RuntimeError("finalized cycle completion facts require Kafka source metadata")
+    for row in completed.select("topic", "partition", "offset").collect():
+        if kafka_offsets.get(row.topic, {}).get(str(int(row.partition)), -1) < int(row.offset):
+            raise RuntimeError("finalized cycle completion exceeds Kafka source watermark")
+    state = spark.read.parquet(str(health_path)).join(completed.select("battery_id", "cycle_index", "replay_sequence"), ["battery_id", "cycle_index"])
+    state_rows = [{**row.asDict(), "dataset": "MATR"} for row in state.collect()]
+    causal_rows = feature_rows(state_rows)
+    lifecycle = spark.read.parquet(str(lifecycle_path)).where("eol_observed AND replay_complete").select("battery_id").collect() if Path(lifecycle_path).exists() else []
+    return publish_state_artifacts(
+        state_root, finalized_keys=keys, state_rows=state_rows, feature_rows=causal_rows,
+        canonical_fingerprint=canonical_fingerprint, arrival_manifest_fingerprint=arrival_manifest_fingerprint,
+        feature_contract_version=FEATURE_VERSION,
+        eligible_completed_training_batteries=[row.battery_id for row in lifecycle],
+        cutoff_metadata={"batch_id": int(batch_id)}, kafka_offsets=kafka_offsets, require_kafka_offsets=True,
+    )
+
+
+def record_current_stream_state(spark, state_root, manifest):
+    """Mirror the already-published finalized state into PostgreSQL for Streamlit."""
+    _, url, props = _serving_selection(spark, "current_models", "model_evaluations")
+    stage = "analytics.stream_state_" + re.sub("[^a-z0-9_]", "_", manifest["state_id"][-16:].lower())
+    spark.createDataFrame([current_stream_state_row("MATR", manifest)], CURRENT_STREAM_STATE_SCHEMA).withColumn("published_at", F.to_timestamp("published_at")).write.jdbc(url, stage, mode="overwrite", properties=props)
+    _execute(spark, url, props["user"], props["password"], build_current_stream_state_upsert_sql(stage))
+    status_stage = stage + "_status"
+    pending = [serving_status_row("MATR", manifest["state_id"], consumer, None, status="pending") for consumer in ("rul_current", "survival_current")]
+    spark.createDataFrame(pending, SERVING_STATUS_SCHEMA).withColumn("updated_at", F.to_timestamp("updated_at")).write.jdbc(url, status_stage, mode="overwrite", properties=props)
+    _execute(spark, url, props["user"], props["password"], build_serving_status_upsert_sql(status_stage))
+
+
+def record_rul_status(spark, manifest, result=None, error=None):
+    selection, url, props = _serving_selection(spark, "current_models", "model_evaluations")
+    state = re.sub("[^a-z0-9_]", "_", manifest["state_id"][-16:].lower())
+    stage = "analytics.stream_rul_status_" + state
+    status = "failed" if error else ("unavailable" if result and result.get("status") == "no_current_model" else "served")
+    row = serving_status_row("MATR", manifest["state_id"], "rul_current", selection, status=status,
+        rows_written=(result or {}).get("rows", 0), error_message=str(error)[:500] if error else None)
+    spark.createDataFrame([row], SERVING_STATUS_SCHEMA).withColumn("updated_at", F.to_timestamp("updated_at")).write.jdbc(url, stage, mode="overwrite", properties=props)
+    _execute(spark, url, props["user"], props["password"], build_serving_status_upsert_sql(stage))
+
+
+def _serving_selection(spark, table, evaluation_table):
+    url = os.environ.get("POSTGRES_JDBC_URL", "jdbc:postgresql://localhost:5432/battery_reliability")
+    props = jdbc_properties(os.environ.get("POSTGRES_USER", "battery_reliability"), os.environ["POSTGRES_PASSWORD"])
+    selected_fingerprint = ", current.model_fingerprint AS selected_fingerprint" if table == "current_survival_models" else ""
+    query = f"(SELECT current.dataset, current.model_version, current.selection_revision, evaluation.model_fingerprint, evaluation.training_metadata{selected_fingerprint} FROM analytics.{table} current JOIN analytics.{evaluation_table} evaluation USING (model_version)) selection"
+    rows = spark.read.jdbc(url, query, properties=props).collect()
+    return (rows[0].asDict(), url, props) if rows else (None, url, props)
+
+
+def _latest_features(state_root, manifest, benchmark_battery_ids=()):
+    rows = json.loads((Path(state_root) / "as_of_cycle_features" / manifest["state_id"] / "features.json").read_text())
+    latest = {}
+    for row in rows:
+        if row["battery_id"] not in set(benchmark_battery_ids) and row["cycle_index"] >= latest.get(row["battery_id"], {"cycle_index": -1})["cycle_index"]:
+            latest[row["battery_id"]] = row
+    return list(latest.values())
+
+
+def run_current_rul_inference(spark, state_root, manifest):
+    """Pin one PostgreSQL selection and monotonically merge newest-cycle RUL rows."""
+    selection, url, props = _serving_selection(spark, "current_models", "model_evaluations")
+    if selection is None:
+        return {"status": "no_current_model"}
+    import joblib
+    metadata = selection["training_metadata"] if isinstance(selection["training_metadata"], dict) else json.loads(selection["training_metadata"])
+    if metadata.get("feature_version") != manifest["feature_contract_version"]:
+        raise RuntimeError("current RUL model feature contract mismatch")
+    model = joblib.load(Path(state_root) / "model_generations" / selection["model_fingerprint"] / "selected_model.joblib")
+    benchmark = json.loads((Path(state_root) / "fixed_offline_benchmark/v1/benchmark.json").read_text())
+    excluded = set(benchmark["splits"]["validation"]["battery_ids"]) | set(benchmark["splits"]["test"]["battery_ids"])
+    features = _latest_features(state_root, manifest, excluded)
+    prior = {row.battery_id: row.asDict() for row in spark.read.jdbc(url, "analytics.battery_current_predictions", properties=props).collect()}
+    rows = current_prediction_rows(model, features, feature_columns=RUL_FEATURES, model_version=selection["model_version"], model_fingerprint=selection["model_fingerprint"], state_id=manifest["state_id"], selection_revision=selection["selection_revision"], benchmark_battery_ids=excluded, prior_predictions=prior)
+    if not rows:
+        return {"status": "no_eligible_features"}
+    stage = "analytics.stream_rul_" + re.sub("[^a-z0-9_]", "_", manifest["state_id"][-16:].lower())
+    spark.createDataFrame(rows, CURRENT_PREDICTION_SCHEMA).withColumn("inference_created_at", F.to_timestamp("inference_created_at")).write.jdbc(url, stage, mode="overwrite", properties=props)
+    _execute(spark, url, props["user"], props["password"], build_current_prediction_upsert_sql(stage))
+    return {"status": "served", "rows": len(rows)}
+
+
+def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAULT_LIFECYCLE_OUTPUT_PATH, completed_cycles_path=DEFAULT_COMPLETED_CYCLES_PATH, offset_watermarks_path=DEFAULT_KAFKA_OFFSETS_PATH, state_root=DEFAULT_STATE_ROOT, canonical_fingerprint="matr-canonical-v1", arrival_manifest_fingerprint="matr-arrival-v1", available_now=False):
     """Start the checkpointed Kafka query and return its StreamingQuery."""
     kafka_records = (
         spark.readStream.format("kafka")
@@ -186,8 +380,29 @@ def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAU
         .load()
     )
     def process_batch(batch, batch_id):
+        upsert_kafka_offset_watermarks(batch, offset_watermarks_path)
         upsert_cycle_health(deduplicate_events(parse_telemetry(batch)), batch_id, output_path)
-        upsert_lifecycle_state(deduplicate_events(parse_lifecycle(batch)), batch_id, lifecycle_output_path)
+        lifecycle = deduplicate_events(parse_lifecycle(batch))
+        upsert_lifecycle_state(lifecycle, batch_id, lifecycle_output_path)
+        upsert_completed_cycles(lifecycle, completed_cycles_path)
+        manifest = publish_completed_state(spark, health_path=output_path, completed_cycles_path=completed_cycles_path,
+            offset_watermarks_path=offset_watermarks_path, state_root=state_root, canonical_fingerprint=canonical_fingerprint,
+            arrival_manifest_fingerprint=arrival_manifest_fingerprint, lifecycle_path=lifecycle_output_path, batch_id=batch_id)
+        if manifest:
+            # latest.json is finalized state only; serving failures cannot retract it.
+            try:
+                record_current_stream_state(spark, state_root, manifest)
+            except Exception as error:
+                print(f"current stream-state mirror failed after finalized state publication: {error}", flush=True)
+            try:
+                result = run_current_rul_inference(spark, state_root, manifest)
+                record_rul_status(spark, manifest, result)
+            except Exception as error:
+                print(f"current RUL serving failed after finalized state publication: {error}", flush=True)
+                try:
+                    record_rul_status(spark, manifest, error=error)
+                except Exception:
+                    pass
 
     writer = (
         kafka_records.writeStream.foreachBatch(process_batch)
@@ -203,6 +418,11 @@ def parse_args():
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--lifecycle-output-path", type=Path, default=DEFAULT_LIFECYCLE_OUTPUT_PATH)
+    parser.add_argument("--completed-cycles-path", type=Path, default=DEFAULT_COMPLETED_CYCLES_PATH)
+    parser.add_argument("--offset-watermarks-path", type=Path, default=DEFAULT_KAFKA_OFFSETS_PATH)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--canonical-fingerprint", default="matr-canonical-v1")
+    parser.add_argument("--arrival-manifest-fingerprint", default="matr-arrival-v1")
     parser.add_argument("--available-now", action="store_true", help="Process current offsets in bounded micro-batches, then exit.")
     return parser.parse_args()
 
@@ -212,7 +432,8 @@ def main():
     spark = build_spark_session(args.master)
     spark.sparkContext.setLogLevel("WARN")
     try:
-        query = start_query(spark, args.output_path, args.checkpoint_path, args.lifecycle_output_path, args.available_now)
+        query = start_query(spark, args.output_path, args.checkpoint_path, args.lifecycle_output_path, args.completed_cycles_path,
+            args.offset_watermarks_path, args.state_root, args.canonical_fingerprint, args.arrival_manifest_fingerprint, args.available_now)
         query.awaitTermination()
     finally:
         spark.stop()
