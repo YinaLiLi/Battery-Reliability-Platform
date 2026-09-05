@@ -24,12 +24,14 @@ try:
     from .progressive_arrival import SEMANTICS_VERSION as PROGRESSIVE_SEMANTICS_VERSION, build_plan as build_progressive_plan
     from .feature_contract import RUL_FEATURES
     from .rul_predictions import constrain_prediction_row
+    from .shared_generation_receipt import SCHEMA_VERSION as RECEIPT_SCHEMA_VERSION, load_receipt_feature_rows, read_receipt
 except ImportError:
     from continuous_arrival import SNAPSHOT_THRESHOLDS, eligible_training_batteries, model_fingerprint, next_snapshot
     from generation_snapshots import SEMANTICS_VERSION, build_generation_plan
     from progressive_arrival import SEMANTICS_VERSION as PROGRESSIVE_SEMANTICS_VERSION, build_plan as build_progressive_plan
     from feature_contract import RUL_FEATURES
     from rul_predictions import constrain_prediction_row
+    from shared_generation_receipt import SCHEMA_VERSION as RECEIPT_SCHEMA_VERSION, load_receipt_feature_rows, read_receipt
 
 ROOT = Path("data/processed/matr")
 TARGET = "rul_cycles"
@@ -189,6 +191,26 @@ def shared_generation_plan(manifest, state_manifest, generation, *, output_root=
             **({"scheduled_manifest_path": Path(output_root) / state_manifest["scheduled_arrival_manifest_ref"]} if progressive else {})}
 
 
+def plan_from_receipt(receipt_path, manifest, *, root=ROOT):
+    """Build the RUL plan only after validating the shared immutable receipt."""
+    receipt = read_receipt(receipt_path)
+    state = json.loads(Path(receipt["state_manifest_path"]).read_text())
+    plan = shared_generation_plan(manifest, state, receipt["generation"], output_root=root)
+    if receipt["schema_version"] == RECEIPT_SCHEMA_VERSION:
+        plan["shared_feature_rows"] = load_receipt_feature_rows(receipt, root=root)
+        plan["shared_feature_metadata"] = {
+            field: receipt[field] for field in (
+                "generation_id", "feature_contract_version", "canonical_source_fingerprint",
+                "selected_row_count", "selected_rows_sha256",
+            )
+        }
+    else:
+        plan["training_features_path"] = Path(receipt["training_features_path"])
+        plan["shared_feature_metadata"] = receipt["training_features"]
+    plan["metadata"]["shared_feature_metadata"] = plan["shared_feature_metadata"]
+    return plan
+
+
 def train_generation(plan, *, root=ROOT, evaluated_at=None):
     """Train exactly one immutable candidate artifact directory."""
     if plan is None:
@@ -198,7 +220,9 @@ def train_generation(plan, *, root=ROOT, evaluated_at=None):
     if evaluation_path.exists():
         return artifact_dir
     evaluated_at = evaluated_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    table = ds.dataset(root / "degradation_features", format="parquet").to_table().to_pydict()
+    table = (pa.Table.from_pylist(plan["shared_feature_rows"]).to_pydict()
+             if plan.get("shared_feature_rows") is not None
+             else ds.dataset(root / "degradation_features", format="parquet").to_table().to_pydict())
     manifest = pq.read_table(root / "arrival_manifest.parquet").to_pylist()
     battery = np.asarray(table["battery_id"])
     labels = np.asarray([np.nan if value is None else value for value in table[TARGET]], float)
@@ -257,6 +281,8 @@ def parse_args():
     parser.add_argument("--state-manifest", type=Path)
     parser.add_argument("--generation")
     parser.add_argument("--training-features", type=Path)
+    parser.add_argument("--receipt", type=Path, help="canonical immutable shared-generation receipt")
+    parser.add_argument("--offline-backfill", action="store_true", help="allow the explicit historical reconstruction path")
     parser.add_argument("--native-threads", type=int, help="limit native model workers for a bounded Airflow task")
     return parser.parse_args()
 
@@ -264,17 +290,23 @@ def parse_args():
 def main():
     args = parse_args()
     manifest = pq.read_table(args.manifest).to_pylist()
-    lifecycle_events = pq.read_table(args.lifecycle_events).to_pylist()
+    if args.receipt and (args.state_manifest or args.generation or args.training_features or args.continuous):
+        raise SystemExit("--receipt cannot be combined with direct state, feature, or continuous arguments")
     if bool(args.state_manifest) != bool(args.generation):
         raise SystemExit("--state-manifest and --generation must be supplied together")
-    plan = (shared_generation_plan(manifest, json.loads(args.state_manifest.read_text()), args.generation, output_root=args.root)
-            if args.state_manifest else generation_plan(manifest, lifecycle_events, output_root=args.root))
+    if not args.receipt and not args.offline_backfill:
+        raise SystemExit("canonical training requires --receipt; use --offline-backfill for historical reconstruction")
+    plan = (plan_from_receipt(args.receipt, manifest, root=args.root) if args.receipt else
+            shared_generation_plan(manifest, json.loads(args.state_manifest.read_text()), args.generation, output_root=args.root)
+            if args.state_manifest else generation_plan(
+                manifest, pq.read_table(args.lifecycle_events).to_pylist(), output_root=args.root
+            ))
     if args.training_features:
         plan["training_features_path"] = args.training_features
     if args.native_threads is not None:
         plan["native_threads"] = args.native_threads
     artifact = train_generation(plan, root=args.root)
-    if artifact and not args.state_manifest:
+    if artifact and args.offline_backfill and not args.state_manifest:
         (args.root / "latest_candidate_generation.txt").write_text(str(artifact))
     print(f"Published candidate artifact {artifact}" if artifact else "No new eligible battery snapshot.")
 

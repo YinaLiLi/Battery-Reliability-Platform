@@ -42,7 +42,7 @@ flowchart TD
     end
 
     subgraph TRAIN["CONTINUOUS TRAINING"]
-        AIRFLOW["Airflow"] --> SHARED["Shared State-Bound Features<br/>built once"]
+        AIRFLOW["Airflow"] --> SHARED["Persistent Shared Feature Outlet"]
         SHARED --> RULTRAIN["RUL Training"]
         SHARED --> SURVTRAIN["Survival Training"]
         RULTRAIN --> CANDIDATES["Immutable Candidate Models"]
@@ -74,9 +74,9 @@ flowchart TD
 
 ## Time-Consistent State
 
-Only cycles with an observed matching `cycle_complete` enter the immutable finalized boundary. The same boundary feeds as-of cycle state and features; future cycles cannot enter operational features or training. The immutable manifest is published after those artifacts are durable and records canonical replay fingerprints plus Kafka lineage.
+Only prefix-complete cycles whose telemetry count matches their `cycle_complete` event enter the compact finalized boundary. New cycle features are appended once to the persistent shared outlet; future cycles cannot alter earlier rows or enter an earlier state selection. The immutable manifest records canonical replay fingerprints plus Kafka lineage.
 
-One shared feature contract owns aggregation, causal history windows, feature ordering, null handling, and imputation semantics. Streaming and PySpark historical processing use the same calculations, including the preceding-nine-cycle windows and `capacity_slope_10`.
+One shared feature contract owns aggregation, causal history windows, feature ordering, null handling, and imputation semantics. The outlet stores only derived features keyed by dataset, battery, and cycle; canonical cycle facts and labels remain in `cycle_summary` and are joined by key.
 
 ## Modeling & Experiment Design
 
@@ -94,12 +94,12 @@ Airflow runs the shared-generation DAG:
 
 ```text
 validate shared state/receipt
-  → build manifest-bound historical features once
+  → select cumulative shared-outlet rows for the generation
   → parallel RUL training/evaluation  ||  parallel Survival training/evaluation
   → independent candidate publish/load
 ```
 
-Both branches use the same state cutoff and arrived cohort. Expensive state-bound preprocessing runs once before fan-out. Each branch writes its own immutable generation artifacts; a failed branch does not delete or roll back a successful sibling. Native model workers and the amd64 Survival container are pool/CPU limited to avoid oversubscription. Candidate publication never changes either manually selected Current Model.
+Both branches receive the same receipt-bound cumulative rows, state cutoff, feature contract, source identity, and arrived cohort before applying family-specific label/event logic. New generations append only newly finalized cycles; they do not recreate historical feature snapshots. Existing receipt-v2 snapshots remain readable for existing models. Each branch writes its own immutable generation artifacts, and candidate publication never changes either manually selected Current Model.
 
 ## Serving & Monitoring
 

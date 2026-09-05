@@ -1,11 +1,13 @@
 import shutil
 import subprocess
 import sys
+import json
 
 import pytest
+import pyarrow.parquet as pq
 
 from src.feature_contract import RUL_FEATURES, aggregate_cycle_samples, feature_rows
-from src.spark_pipeline import build_features
+from src.spark_pipeline import append_feature_outlet, build_features, materialize_shared_features
 
 
 @pytest.fixture(scope="module")
@@ -68,3 +70,44 @@ def test_historical_features_match_streaming_contract_for_finalized_cycles(spark
         for feature in RUL_FEATURES:
             actual, expected = historical[key].get(feature), stream_row.get(feature)
             assert actual == expected if actual is None or expected is None else actual == pytest.approx(expected), (key, feature, actual, expected)
+
+
+def test_state_bound_features_are_materialized_once_and_reused(spark, tmp_path):
+    state_path = tmp_path / "stream_state" / "state-1" / "manifest.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "state_id": "state-1", "feature_contract_version": "feature-v1",
+        "finalized_cycle_boundary_fingerprint": "boundary-v1",
+        "cutoff_metadata": {"replay_cutoff": "2025-01-01T00:00:00+00:00"},
+        "arrived_train_battery_ids": ["b1"], "observed_eol_train_battery_ids": ["b1"],
+        "censored_train_battery_ids": [],
+    }, sort_keys=True))
+    output = tmp_path / "historical_features" / "state-1"
+    first = spark.createDataFrame([("b1", 1, 1.0)], "battery_id string, cycle_index int, feature double")
+    second = spark.createDataFrame([("b1", 1, 9.0)], "battery_id string, cycle_index int, feature double")
+
+    metadata = materialize_shared_features(first, output, state_manifest_path=state_path, generation="1.2")
+    reused = materialize_shared_features(second, output, state_manifest_path=state_path, generation="1.2")
+
+    assert metadata == reused
+    assert spark.read.parquet(str(output)).first().feature == 1.0
+
+
+def test_feature_outlet_append_persists_only_key_generation_contract_and_derived_features(spark, tmp_path):
+    frame = spark.createDataFrame([{
+        "dataset": "MATR", "battery_id": "b1", "cycle_index": 1,
+        "soh": 0.95, "discharge_capacity_in_Ah": 1.0,
+        "voltage_mean_in_V": 3.2, "capacity_fade_from_prior": -0.1,
+    }])
+
+    result = append_feature_outlet(
+        frame, tmp_path / "shared_feature_outlet", generation="1.0",
+        feature_contract_version="features-v1", canonical_source_fingerprint="canonical-v1",
+    )
+
+    assert result["appended_row_count"] == 1
+    row = pq.read_table(next((tmp_path / "shared_feature_outlet" / "segments").glob("*.parquet"))).to_pylist()[0]
+    assert set(row) == {
+        "dataset", "battery_id", "cycle_index", "generation_id", "feature_contract_version",
+        "voltage_mean_in_V", "capacity_fade_from_prior",
+    }

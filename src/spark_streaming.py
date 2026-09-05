@@ -9,17 +9,19 @@ from pathlib import Path
 from pyspark.sql import SparkSession, functions as F, types as T
 try:
     from .stream_runtime import publish_state_artifacts, publish_latest_manifest
-    from .stream_state import build_finalized_cycle_boundary, state_id_for_boundary
+    from .stream_state import build_compact_finalized_cycle_boundary, state_id_for_boundary
     from .train_matr_models import FEATURE_VERSION
-    from .feature_contract import RUL_FEATURES, feature_rows, render_spark_cycle_aggregate, spark_cycle_aggregate_expressions
+    from .feature_contract import RUL_FEATURES, SHARED_FEATURE_COLUMNS, feature_rows, render_spark_cycle_aggregate, spark_cycle_aggregate_expressions
+    from .shared_features import append_shared_feature_rows, feature_outlet_key_maxima, generation_for_timestamp, load_current_feature_rows
     from .stream_inference import current_prediction_rows
     from .serving_status import current_stream_state_row, serving_status_row
     from .postgres_loader import build_current_prediction_upsert_sql, build_current_stream_state_upsert_sql, build_serving_status_upsert_sql, _execute, jdbc_properties
 except ImportError:
     from stream_runtime import publish_state_artifacts, publish_latest_manifest
-    from stream_state import build_finalized_cycle_boundary, state_id_for_boundary
+    from stream_state import build_compact_finalized_cycle_boundary, state_id_for_boundary
     from train_matr_models import FEATURE_VERSION
-    from feature_contract import RUL_FEATURES, feature_rows, render_spark_cycle_aggregate, spark_cycle_aggregate_expressions
+    from feature_contract import RUL_FEATURES, SHARED_FEATURE_COLUMNS, feature_rows, render_spark_cycle_aggregate, spark_cycle_aggregate_expressions
+    from shared_features import append_shared_feature_rows, feature_outlet_key_maxima, generation_for_timestamp, load_current_feature_rows
     from stream_inference import current_prediction_rows
     from serving_status import current_stream_state_row, serving_status_row
     from postgres_loader import build_current_prediction_upsert_sql, build_current_stream_state_upsert_sql, build_serving_status_upsert_sql, _execute, jdbc_properties
@@ -33,6 +35,8 @@ DEFAULT_LIFECYCLE_OUTPUT_PATH = Path("data/processed/matr/replay_lifecycle_state
 DEFAULT_COMPLETED_CYCLES_PATH = Path("data/processed/matr/replay_completed_cycles")
 DEFAULT_KAFKA_OFFSETS_PATH = Path("data/processed/matr/replay_kafka_offsets")
 DEFAULT_STATE_ROOT = Path("data/processed/matr")
+DEFAULT_ARRIVAL_MANIFEST_PATH = Path("data/processed/matr/arrival_manifest.parquet")
+DEFAULT_CANONICAL_CYCLES_PATH = Path("data/processed/matr/cycle_summary")
 TOPIC = "battery_measurements"
 LIFECYCLE_TOPIC = "battery_lifecycle"
 SHUFFLE_PARTITIONS = 3
@@ -67,6 +71,7 @@ LIFECYCLE_SCHEMA = T.StructType([
     T.StructField("cycle_index", T.IntegerType()),
     T.StructField("replay_event_time", T.StringType()),
     T.StructField("replay_sequence", T.LongType()),
+    T.StructField("expected_telemetry_rows", T.LongType()),
     T.StructField("schema_version", T.StringType()),
 ])
 
@@ -188,7 +193,8 @@ def build_lifecycle_state(lifecycle):
 def finalized_cycle_boundary(lifecycle):
     """Return only explicitly completed cycles; no timestamp reconstruction is allowed."""
     return deduplicate_events(lifecycle).where(F.col("event_type") == "cycle_complete").select(
-        "dataset", "battery_id", "cycle_index", "replay_sequence", "event_time", "topic", "partition", "offset"
+        "dataset", "battery_id", "cycle_index", "replay_sequence", "expected_telemetry_rows",
+        "event_time", "topic", "partition", "offset"
     ).dropDuplicates(["dataset", "battery_id", "cycle_index"])
 
 
@@ -226,7 +232,7 @@ def upsert_lifecycle_state(batch, _batch_id, output_path):
     output_path = Path(output_path)
     incoming = build_lifecycle_state(batch)
     if output_path.exists():
-        incoming = incoming.unionByName(batch.sparkSession.read.parquet(str(output_path)))
+        incoming = incoming.unionByName(batch.sparkSession.read.parquet(str(output_path)), allowMissingColumns=True)
     state = incoming.groupBy("battery_id").agg(
         F.max(F.col("eol_observed").cast("int")).cast("boolean").alias("eol_observed"),
         F.max(F.col("replay_complete").cast("int")).cast("boolean").alias("replay_complete"),
@@ -271,37 +277,141 @@ def kafka_offset_watermarks(spark, path):
     return result
 
 
-def publish_completed_state(spark, *, health_path, completed_cycles_path, offset_watermarks_path, state_root, canonical_fingerprint, arrival_manifest_fingerprint, lifecycle_path, batch_id):
+def shared_training_cohort(arrival_rows, *, arrived_battery_ids, observed_eol_ids):
+    """Bind both model families to one arrived training cohort."""
+    arrived_battery_ids, observed_eol_ids = set(arrived_battery_ids), set(observed_eol_ids)
+    arrived = [
+        row["battery_id"] for row in sorted(arrival_rows, key=lambda row: row["arrival_rank"])
+        if row["split"] == "train" and row["battery_id"] in arrived_battery_ids
+    ]
+    observed = [battery_id for battery_id in arrived if battery_id in observed_eol_ids]
+    observed_set = set(observed)
+    return {
+        "arrived_train_battery_ids": arrived,
+        "observed_eol_train_battery_ids": observed,
+        "censored_train_battery_ids": [battery_id for battery_id in arrived if battery_id not in observed_set],
+    }
+
+
+def publish_completed_state(spark, *, health_path, completed_cycles_path, offset_watermarks_path, state_root, canonical_fingerprint, arrival_manifest_fingerprint=None, lifecycle_path, batch_id, arrival_manifest_path=DEFAULT_ARRIVAL_MANIFEST_PATH, canonical_cycles_path=DEFAULT_CANONICAL_CYCLES_PATH):
     """Publish state only after both the accumulated health and completion boundary exist."""
     if not Path(health_path).exists() or not Path(completed_cycles_path).exists():
         return None
-    completed = spark.read.parquet(str(completed_cycles_path)).orderBy("dataset", "battery_id", "cycle_index")
-    keys = [{"dataset": row.dataset, "battery_id": row.battery_id, "cycle_index": int(row.cycle_index)} for row in completed.collect()]
-    if not keys:
+    completed = spark.read.parquet(str(completed_cycles_path))
+    if "expected_telemetry_rows" not in completed.columns:
+        raise RuntimeError("cycle completion facts require expected_telemetry_rows")
+    health = spark.read.parquet(str(health_path))
+    counts = health.select("battery_id", "cycle_index", "event_count")
+    completion = completed.join(counts, ["battery_id", "cycle_index"], "left")
+    if completion.where(F.col("event_count") > F.col("expected_telemetry_rows")).limit(1).count():
+        raise RuntimeError("cycle telemetry exceeds its immutable completion count")
+    ready = completion.where(
+        F.col("expected_telemetry_rows").isNotNull()
+        & (F.col("event_count") == F.col("expected_telemetry_rows"))
+    ).orderBy("dataset", "battery_id", "cycle_index")
+    ready_rows = [row.asDict() for row in ready.collect()]
+    canonical_rows = [row.asDict() for row in spark.read.parquet(str(canonical_cycles_path)).select(
+        "dataset", "battery_id", "cycle_index"
+    ).orderBy("dataset", "battery_id", "cycle_index").collect()]
+    ready_keys = {(row["dataset"], row["battery_id"], int(row["cycle_index"])) for row in ready_rows}
+    prefix_keys = set()
+    blocked = set()
+    for row in canonical_rows:
+        key = row["dataset"], row["battery_id"], int(row["cycle_index"])
+        battery = key[:2]
+        if battery in blocked:
+            continue
+        if key in ready_keys:
+            prefix_keys.add(key)
+        else:
+            blocked.add(battery)
+    prefix_rows = [row for row in ready_rows if (row["dataset"], row["battery_id"], int(row["cycle_index"])) in prefix_keys]
+    if not prefix_rows:
         return None
-    boundary = build_finalized_cycle_boundary(keys, canonical_fingerprint=canonical_fingerprint,
-        arrival_manifest_fingerprint=arrival_manifest_fingerprint, feature_contract_version=FEATURE_VERSION)
+    arrival_rows = [row.asDict() for row in spark.read.parquet(str(arrival_manifest_path)).select(
+        "battery_id", "split", "arrival_rank", "schedule_fingerprint"
+    ).collect()]
+    arrival_fingerprints = {row["schedule_fingerprint"] for row in arrival_rows}
+    if len(arrival_fingerprints) != 1:
+        raise RuntimeError("arrival manifest must contain one schedule fingerprint")
+    actual_arrival_fingerprint = arrival_fingerprints.pop()
+    if arrival_manifest_fingerprint and arrival_manifest_fingerprint != actual_arrival_fingerprint:
+        raise RuntimeError("configured arrival manifest fingerprint does not match the replay manifest")
+    boundary = build_compact_finalized_cycle_boundary(
+        prefix_rows, canonical_cycle_keys=canonical_rows, canonical_fingerprint=canonical_fingerprint,
+        arrival_manifest_fingerprint=actual_arrival_fingerprint, feature_contract_version=FEATURE_VERSION,
+    )
     state_id = state_id_for_boundary(boundary)
     if (Path(state_root) / "stream_state" / state_id / "manifest.json").exists():
         return None
     kafka_offsets = kafka_offset_watermarks(spark, offset_watermarks_path)
     if not kafka_offsets:
         raise RuntimeError("Kafka-produced finalized state requires source offset watermarks")
-    if not {"topic", "partition", "offset"}.issubset(completed.columns):
+    if not {"topic", "partition", "offset"}.issubset(ready.columns):
         raise RuntimeError("finalized cycle completion facts require Kafka source metadata")
-    for row in completed.select("topic", "partition", "offset").collect():
+    for row in ready.select("topic", "partition", "offset").collect():
         if kafka_offsets.get(row.topic, {}).get(str(int(row.partition)), -1) < int(row.offset):
             raise RuntimeError("finalized cycle completion exceeds Kafka source watermark")
-    state = spark.read.parquet(str(health_path)).join(completed.select("battery_id", "cycle_index", "replay_sequence"), ["battery_id", "cycle_index"])
-    state_rows = [{**row.asDict(), "dataset": "MATR"} for row in state.collect()]
-    causal_rows = feature_rows(state_rows)
+    prefix = spark.createDataFrame(prefix_rows).select("battery_id", "cycle_index", "replay_sequence", "event_time")
+    state = health.join(prefix, ["battery_id", "cycle_index"])
+    outlet_path = Path(state_root) / "shared_feature_outlet"
+    maxima = feature_outlet_key_maxima(outlet_path) if (outlet_path / "_outlet.json").exists() else {}
+    new_keys = {(row["dataset"], row["battery_id"], int(row["cycle_index"])) for row in prefix_rows
+                if int(row["cycle_index"]) > maxima.get((row["dataset"], row["battery_id"]), 0)}
+    context_keys = set()
+    prefix_by_battery = {}
+    for row in prefix_rows:
+        prefix_by_battery.setdefault((row["dataset"], row["battery_id"]), []).append(int(row["cycle_index"]))
+    for dataset_battery, cycles in prefix_by_battery.items():
+        cycles.sort()
+        for cycle in (value for value in cycles if (*dataset_battery, value) in new_keys):
+            position = cycles.index(cycle)
+            context_keys.update((*dataset_battery, value) for value in ({cycles[0]} | set(cycles[max(0, position - 9):position + 1])))
+    if context_keys:
+        context = spark.createDataFrame([
+            {"battery_id": battery_id, "cycle_index": cycle_index}
+            for _, battery_id, cycle_index in sorted(context_keys)
+        ]).join(state, ["battery_id", "cycle_index"])
+        context_rows = [{**row.asDict(), "dataset": "MATR"} for row in context.collect()]
+        causal_rows = [row for row in feature_rows(context_rows)
+                       if (row["dataset"], row["battery_id"], int(row["cycle_index"])) in new_keys]
+    else:
+        causal_rows = []
     lifecycle = spark.read.parquet(str(lifecycle_path)).where("eol_observed AND replay_complete").select("battery_id").collect() if Path(lifecycle_path).exists() else []
+    if "event_time" not in ready.columns:
+        raise RuntimeError("finalized cycle completion facts require replay event time for the training cutoff")
+    cutoff = prefix.select(
+        F.date_format(F.max("event_time"), "yyyy-MM-dd'T'HH:mm:ssXXX").alias("replay_cutoff")
+    ).first().replay_cutoff
+    if cutoff is None:
+        raise RuntimeError("finalized cycle completion facts require a replay cutoff")
+    cohort = shared_training_cohort(
+        arrival_rows,
+        arrived_battery_ids={row["battery_id"] for row in prefix_rows},
+        observed_eol_ids={row.battery_id for row in lifecycle},
+    )
+    by_generation = {}
+    for row in causal_rows:
+        by_generation.setdefault(generation_for_timestamp(row["event_time"]), []).append({
+            key: row.get(key) for key in ("dataset", "battery_id", "cycle_index", *SHARED_FEATURE_COLUMNS)
+            if key in row
+        })
+    for generation, rows in sorted(by_generation.items()):
+        append_shared_feature_rows(
+            outlet_path, rows, generation=generation,
+            feature_contract_version=FEATURE_VERSION, canonical_source_fingerprint=canonical_fingerprint,
+        )
     return publish_state_artifacts(
-        state_root, finalized_keys=keys, state_rows=state_rows, feature_rows=causal_rows,
-        canonical_fingerprint=canonical_fingerprint, arrival_manifest_fingerprint=arrival_manifest_fingerprint,
+        state_root, finalized_keys=[{
+            "dataset": row["dataset"], "battery_id": row["battery_id"],
+            "cycle_index": int(row["cycle_index"]),
+        } for row in prefix_rows], state_rows=[], feature_rows=causal_rows,
+        canonical_fingerprint=canonical_fingerprint, arrival_manifest_fingerprint=actual_arrival_fingerprint,
         feature_contract_version=FEATURE_VERSION,
-        eligible_completed_training_batteries=[row.battery_id for row in lifecycle],
-        cutoff_metadata={"batch_id": int(batch_id)}, kafka_offsets=kafka_offsets, require_kafka_offsets=True,
+        eligible_completed_training_batteries=cohort["observed_eol_train_battery_ids"],
+        cutoff_metadata={"batch_id": int(batch_id), "replay_cutoff": cutoff},
+        kafka_offsets=kafka_offsets, require_kafka_offsets=True, shared_training_cohort=cohort,
+        boundary=boundary,
     )
 
 
@@ -338,12 +448,7 @@ def _serving_selection(spark, table, evaluation_table):
 
 
 def _latest_features(state_root, manifest, benchmark_battery_ids=()):
-    rows = json.loads((Path(state_root) / "as_of_cycle_features" / manifest["state_id"] / "features.json").read_text())
-    latest = {}
-    for row in rows:
-        if row["battery_id"] not in set(benchmark_battery_ids) and row["cycle_index"] >= latest.get(row["battery_id"], {"cycle_index": -1})["cycle_index"]:
-            latest[row["battery_id"]] = row
-    return list(latest.values())
+    return load_current_feature_rows(state_root, manifest, excluded_battery_ids=benchmark_battery_ids)
 
 
 def run_current_rul_inference(spark, state_root, manifest):
@@ -369,7 +474,7 @@ def run_current_rul_inference(spark, state_root, manifest):
     return {"status": "served", "rows": len(rows)}
 
 
-def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAULT_LIFECYCLE_OUTPUT_PATH, completed_cycles_path=DEFAULT_COMPLETED_CYCLES_PATH, offset_watermarks_path=DEFAULT_KAFKA_OFFSETS_PATH, state_root=DEFAULT_STATE_ROOT, canonical_fingerprint="matr-canonical-v1", arrival_manifest_fingerprint="matr-arrival-v1", available_now=False):
+def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAULT_LIFECYCLE_OUTPUT_PATH, completed_cycles_path=DEFAULT_COMPLETED_CYCLES_PATH, offset_watermarks_path=DEFAULT_KAFKA_OFFSETS_PATH, state_root=DEFAULT_STATE_ROOT, canonical_fingerprint="matr-canonical-v1", arrival_manifest_fingerprint=None, available_now=False, arrival_manifest_path=DEFAULT_ARRIVAL_MANIFEST_PATH, canonical_cycles_path=DEFAULT_CANONICAL_CYCLES_PATH):
     """Start the checkpointed Kafka query and return its StreamingQuery."""
     kafka_records = (
         spark.readStream.format("kafka")
@@ -387,7 +492,8 @@ def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAU
         upsert_completed_cycles(lifecycle, completed_cycles_path)
         manifest = publish_completed_state(spark, health_path=output_path, completed_cycles_path=completed_cycles_path,
             offset_watermarks_path=offset_watermarks_path, state_root=state_root, canonical_fingerprint=canonical_fingerprint,
-            arrival_manifest_fingerprint=arrival_manifest_fingerprint, lifecycle_path=lifecycle_output_path, batch_id=batch_id)
+            arrival_manifest_fingerprint=arrival_manifest_fingerprint, lifecycle_path=lifecycle_output_path,
+            arrival_manifest_path=arrival_manifest_path, canonical_cycles_path=canonical_cycles_path, batch_id=batch_id)
         if manifest:
             # latest.json is finalized state only; serving failures cannot retract it.
             try:
@@ -422,7 +528,9 @@ def parse_args():
     parser.add_argument("--offset-watermarks-path", type=Path, default=DEFAULT_KAFKA_OFFSETS_PATH)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--canonical-fingerprint", default="matr-canonical-v1")
-    parser.add_argument("--arrival-manifest-fingerprint", default="matr-arrival-v1")
+    parser.add_argument("--arrival-manifest-fingerprint", help="optional expected fingerprint; the state records the manifest's actual fingerprint")
+    parser.add_argument("--arrival-manifest-path", type=Path, default=DEFAULT_ARRIVAL_MANIFEST_PATH)
+    parser.add_argument("--canonical-cycles-path", type=Path, default=DEFAULT_CANONICAL_CYCLES_PATH)
     parser.add_argument("--available-now", action="store_true", help="Process current offsets in bounded micro-batches, then exit.")
     return parser.parse_args()
 
@@ -433,7 +541,8 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
     try:
         query = start_query(spark, args.output_path, args.checkpoint_path, args.lifecycle_output_path, args.completed_cycles_path,
-            args.offset_watermarks_path, args.state_root, args.canonical_fingerprint, args.arrival_manifest_fingerprint, args.available_now)
+            args.offset_watermarks_path, args.state_root, args.canonical_fingerprint, args.arrival_manifest_fingerprint,
+            args.available_now, args.arrival_manifest_path, args.canonical_cycles_path)
         query.awaitTermination()
     finally:
         spark.stop()

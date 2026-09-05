@@ -140,3 +140,19 @@ def test_ipcw_metrics_exclude_rows_after_censoring_support_ends():
     ]
 
     assert survival._ipcw_supported_rows(train, evaluation) == evaluation[:1]
+
+
+def test_shared_receipt_cohort_freezes_training_event_semantics():
+    lifecycle = [
+        {"battery_id": "observed", "eol_observed": True},
+        {"battery_id": "censored", "eol_observed": True},
+        {"battery_id": "validation", "eol_observed": True},
+    ]
+    plan = {
+        "arrived_train_battery_ids": ["observed", "censored"],
+        "observed_eol_train_battery_ids": ["observed"],
+    }
+
+    frozen = survival.state_bound_lifecycle(lifecycle, plan)
+
+    assert {row["battery_id"] for row in frozen if row.get("eol_observed")} == {"observed", "validation"}

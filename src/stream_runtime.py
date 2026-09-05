@@ -5,9 +5,9 @@ import os
 from pathlib import Path
 
 try:
-    from .stream_state import build_finalized_cycle_boundary, create_stream_state_manifest
+    from .stream_state import build_finalized_cycle_boundary, create_stream_state_manifest, validate_finalized_cycle_boundary
 except ImportError:
-    from stream_state import build_finalized_cycle_boundary, create_stream_state_manifest
+    from stream_state import build_finalized_cycle_boundary, create_stream_state_manifest, validate_finalized_cycle_boundary
 
 
 def _atomic_json(path, value):
@@ -26,30 +26,35 @@ def _immutable_json(path, value):
     _atomic_json(path, value)
 
 
-def publish_state_artifacts(root, *, finalized_keys, state_rows, feature_rows, canonical_fingerprint, arrival_manifest_fingerprint, feature_contract_version, eligible_completed_training_batteries, cutoff_metadata, kafka_offsets, publish_latest=True, require_kafka_offsets=False):
+def publish_state_artifacts(root, *, finalized_keys, state_rows, feature_rows, canonical_fingerprint, arrival_manifest_fingerprint, feature_contract_version, eligible_completed_training_batteries, cutoff_metadata, kafka_offsets, publish_latest=True, require_kafka_offsets=False, shared_training_cohort=None, boundary=None):
     """Write immutable artifacts first, then atomically expose their manifest."""
     root = Path(root)
-    boundary = build_finalized_cycle_boundary(
-        finalized_keys, canonical_fingerprint=canonical_fingerprint,
-        arrival_manifest_fingerprint=arrival_manifest_fingerprint,
-        feature_contract_version=feature_contract_version,
-    )
+    if boundary is None:
+        boundary = build_finalized_cycle_boundary(
+            finalized_keys, canonical_fingerprint=canonical_fingerprint,
+            arrival_manifest_fingerprint=arrival_manifest_fingerprint,
+            feature_contract_version=feature_contract_version,
+        )
+    else:
+        validate_finalized_cycle_boundary(boundary)
     provisional = create_stream_state_manifest(
         boundary, boundary_ref="pending", eligible_completed_training_batteries=eligible_completed_training_batteries,
         cutoff_metadata=cutoff_metadata, kafka_offsets=kafka_offsets,
     )
+    if shared_training_cohort:
+        provisional = {**provisional, **shared_training_cohort}
     state_id = provisional["state_id"]
     if require_kafka_offsets and not kafka_offsets:
         raise ValueError("Kafka-produced stream state requires source offsets")
     boundary_path = root / "finalized_cycle_boundary" / state_id / "boundary.json"
     _immutable_json(boundary_path, boundary)
-    _immutable_json(root / "as_of_cycle_state" / state_id / "state.json", state_rows)
-    _immutable_json(root / "as_of_cycle_features" / state_id / "features.json", feature_rows)
     manifest = create_stream_state_manifest(
         boundary, boundary_ref=str(boundary_path.relative_to(root)),
         eligible_completed_training_batteries=eligible_completed_training_batteries,
         cutoff_metadata=cutoff_metadata, kafka_offsets=kafka_offsets,
     )
+    if shared_training_cohort:
+        manifest = {**manifest, **shared_training_cohort}
     _immutable_json(root / "stream_state" / state_id / "manifest.json", manifest)
     if publish_latest:
         _atomic_json(root / "stream_state" / "latest.json", manifest)

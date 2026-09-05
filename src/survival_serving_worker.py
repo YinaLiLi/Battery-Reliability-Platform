@@ -7,11 +7,13 @@ from pathlib import Path
 
 try:
     from .feature_contract import RUL_FEATURES
+    from .shared_features import load_current_feature_rows
     from .serving_status import current_stream_state_row, serving_status_row, upsert_current_stream_state, upsert_serving_status
     from .stream_state import validate_finalized_cycle_boundary, validate_stream_state_manifest
     from .survival_stream_inference import current_survival_rows
 except ImportError:
     from feature_contract import RUL_FEATURES
+    from shared_features import load_current_feature_rows
     from serving_status import current_stream_state_row, serving_status_row, upsert_current_stream_state, upsert_serving_status
     from stream_state import validate_finalized_cycle_boundary, validate_stream_state_manifest
     from survival_stream_inference import current_survival_rows
@@ -98,8 +100,7 @@ def process_once(root, connection):
             upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection))
             benchmark = json.loads((root / "fixed_offline_benchmark/v1/benchmark.json").read_text())
             excluded = set(benchmark["splits"]["validation"]["battery_ids"]) | set(benchmark["splits"]["test"]["battery_ids"])
-            features = json.loads((root / "as_of_cycle_features" / manifest["state_id"] / "features.json").read_text())
-            features = newest_finalized_features(features, boundary, excluded)
+            features = load_current_feature_rows(root, manifest, excluded_battery_ids=excluded)
             if not features:
                 upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection, status="served"))
                 connection.commit()

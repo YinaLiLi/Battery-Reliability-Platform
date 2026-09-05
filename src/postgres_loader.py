@@ -9,7 +9,7 @@ DEFAULT_MASTER = os.environ.get("SPARK_MASTER", "local[*]")
 DEFAULT_JDBC_URL = "jdbc:postgresql://localhost:5432/battery_reliability"
 ROOT = Path("data/processed/matr")
 DATASETS = {
-    "battery_cycle_health": {"path": ROOT / "degradation_features", "table": "analytics.battery_cycle_health", "keys": ("dataset", "battery_id", "cycle_index"), "snapshot": True},
+    "battery_cycle_health": {"path": ROOT / "cycle_summary", "table": "analytics.battery_cycle_health", "keys": ("dataset", "battery_id", "cycle_index"), "snapshot": True},
     "battery_replay_windows": {"path": ROOT / "replay_cycle_health", "table": "analytics.battery_replay_windows", "keys": ("battery_id", "cycle_index"), "snapshot": True},
     "battery_predictions": {"path": ROOT / "published_predictions.parquet", "table": "analytics.battery_predictions", "keys": ("model_version", "dataset", "battery_id", "cycle_index"), "snapshot": False},
     "model_evaluations": {"path": ROOT / "published_model_evaluation.parquet", "table": "analytics.model_evaluations", "keys": ("model_version",), "snapshot": False},
@@ -134,7 +134,12 @@ def assert_group_totals_match(source, target, group_columns, value_column, datas
     if left.join(right, list(group_columns), "full").where(F.coalesce(F.col("source_total"), F.lit(0)) != F.coalesce(F.col("target_total"), F.lit(0))).limit(1).count(): raise RuntimeError(f"{dataset} group totals differ after PostgreSQL load")
 
 def load_snapshot(spark, dataset, jdbc_url, user, password, source_path=None):
-    config = DATASETS[dataset]; frame = PREPARERS[dataset](spark.read.parquet(str(source_path or config["path"])))
+    config = DATASETS[dataset]
+    frame = spark.read.parquet(str(source_path or config["path"]))
+    if dataset == "battery_cycle_health" and source_path is None:
+        features = spark.read.parquet(str(ROOT / "shared_feature_outlet" / "segments"))
+        frame = frame.join(features.select("dataset", "battery_id", "cycle_index", "capacity_slope_10", "coulombic_efficiency"), ["dataset", "battery_id", "cycle_index"])
+    frame = PREPARERS[dataset](frame)
     validate_snapshot(frame, dataset); source_count = frame.count(); properties = jdbc_properties(user, password)
     if config["snapshot"]: _execute(spark, jdbc_url, user, password, f"TRUNCATE TABLE {config['table']}")
     else:

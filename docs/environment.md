@@ -92,11 +92,16 @@ docker compose run --rm spark-stream-submit
 
 The bounded replay verifies infrastructure, not the full published experiment. The
 normalizer creates the arrival manifest. Full replay (`python src/kafka_producer.py`)
-is expensive and publishes the corpus. Once finalized state exists, use
-`python src/generation_snapshots.py --generation 1.0` and
-`python src/shared_generation_receipt.py --state-manifest <printed-path> --generation 1.0`,
-then trigger `matr_shared_generation_retraining` with the receipt path in its JSON
-configuration. Missing data/benchmark is caught by `--data` before expensive jobs.
+is expensive and publishes the corpus. For continuous training, trigger
+`matr_shared_generation_retraining` with `state_manifest` set to a Streaming-issued
+finalized manifest and `generation` set to the intended generation. The DAG validates
+Kafka lineage and the persistent shared feature outlet, finalizes one cumulative selection receipt,
+and then fans out the same rows to RUL and Survival. Streaming appends only newly
+prefix-complete cycles; no per-generation historical feature snapshot is created.
+`generation_snapshots.py` remains the
+explicit offline/backfill state-reconstruction entry point; direct trainer use from
+that path requires `--offline-backfill`. Missing data/benchmark is caught by `--data`
+before expensive jobs.
 Measure disk and memory on the target machine before the full 130M-row experiment;
 the bounded smoke is not a full-corpus resource certification.
 

@@ -24,3 +24,16 @@ def test_shared_plan_keeps_one_cohort_identity_for_both_model_families(tmp_path)
     assert first["arrived_train_battery_ids"] == second["arrived_train_battery_ids"]
     assert first["observed_eol_train_battery_ids"] == second["observed_eol_train_battery_ids"]
     assert first["fingerprint"] != second["fingerprint"]
+
+
+def test_streaming_state_cutoff_is_the_shared_generation_cutoff(tmp_path):
+    state = {
+        "state_id": "state", "finalized_cycle_boundary_fingerprint": "boundary",
+        "arrived_train_battery_ids": ["event", "active"],
+        "observed_eol_train_battery_ids": ["event"], "censored_train_battery_ids": ["active"],
+        "cutoff_metadata": {"replay_cutoff": "2025-01-01T12:00:00+00:00"},
+    }
+
+    plan = build_generation_plan("1.0", _manifest(), state, model_config={}, feature_version="features", artifact_root=tmp_path)
+
+    assert plan["cutoff"] == datetime(2025, 1, 1, 12, tzinfo=timezone.utc)

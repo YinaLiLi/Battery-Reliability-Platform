@@ -16,10 +16,12 @@ from sklearn.preprocessing import StandardScaler
 try:
     from .generation_snapshots import SEMANTICS_VERSION, build_generation_plan
     from .progressive_arrival import SEMANTICS_VERSION as PROGRESSIVE_SEMANTICS_VERSION, build_plan as build_progressive_plan
+    from .shared_generation_receipt import SCHEMA_VERSION as RECEIPT_SCHEMA_VERSION, load_receipt_feature_rows, read_receipt
     from .train_matr_models import RUL_FEATURES, SPLIT_VERSION
 except ImportError:
     from generation_snapshots import SEMANTICS_VERSION, build_generation_plan
     from progressive_arrival import SEMANTICS_VERSION as PROGRESSIVE_SEMANTICS_VERSION, build_plan as build_progressive_plan
+    from shared_generation_receipt import SCHEMA_VERSION as RECEIPT_SCHEMA_VERSION, load_receipt_feature_rows, read_receipt
     from train_matr_models import RUL_FEATURES, SPLIT_VERSION
 
 try:
@@ -212,6 +214,35 @@ def survival_generation_plan(manifest, state_manifest, generation, *, root=ROOT)
             **({"scheduled_manifest_path": Path(root) / state_manifest["scheduled_arrival_manifest_ref"]} if progressive else {})}
 
 
+def state_bound_lifecycle(lifecycle, plan):
+    """Freeze training events to the receipt cohort while retaining held-out facts."""
+    arrived = set(plan["arrived_train_battery_ids"])
+    retained = [row for row in lifecycle if row["battery_id"] not in arrived]
+    return retained + [
+        {"battery_id": battery_id, "eol_observed": True}
+        for battery_id in plan["observed_eol_train_battery_ids"]
+    ]
+
+
+def plan_from_receipt(receipt_path, manifest, *, root=ROOT):
+    """Build the Survival plan only after validating the shared immutable receipt."""
+    receipt = read_receipt(receipt_path)
+    state = json.loads(Path(receipt["state_manifest_path"]).read_text())
+    plan = survival_generation_plan(manifest, state, receipt["generation"], root=root)
+    if receipt["schema_version"] == RECEIPT_SCHEMA_VERSION:
+        plan["shared_feature_rows"] = load_receipt_feature_rows(receipt, root=root)
+        plan["shared_feature_metadata"] = {
+            field: receipt[field] for field in (
+                "generation_id", "feature_contract_version", "canonical_source_fingerprint",
+                "selected_row_count", "selected_rows_sha256",
+            )
+        }
+    else:
+        plan["training_features_path"] = Path(receipt["training_features_path"])
+        plan["shared_feature_metadata"] = receipt["training_features"]
+    return plan
+
+
 def train_generation(plan, *, root=ROOT, evaluated_at=None):
     """Fit one isolated candidate and score only each battery's latest landmark."""
     if plan is None:
@@ -220,9 +251,12 @@ def train_generation(plan, *, root=ROOT, evaluated_at=None):
     evaluation_path = artifact_dir / "candidate_survival_model_evaluation.parquet"
     if evaluation_path.exists():
         return artifact_dir
-    features = ds.dataset(root / "degradation_features", format="parquet").to_table().to_pylist()
+    features = (list(plan["shared_feature_rows"]) if plan.get("shared_feature_rows") is not None
+                else ds.dataset(root / "degradation_features", format="parquet").to_table().to_pylist())
     manifest = pq.read_table(plan.get("scheduled_manifest_path", root / "arrival_manifest.parquet")).to_pylist()
     lifecycle = pq.read_table(root / "replay_lifecycle_state").to_pylist()
+    if plan.get("shared_feature_metadata"):
+        lifecycle = state_bound_lifecycle(lifecycle, plan)
     if plan.get("training_features_path"):
         split_by_battery = {row["battery_id"]: row["split"] for row in manifest}
         state_features = ds.dataset(plan["training_features_path"], format="parquet").to_table().to_pylist()
@@ -250,7 +284,7 @@ def train_generation(plan, *, root=ROOT, evaluated_at=None):
         {"model_version": plan["model_version"], "dataset": row["dataset"], "battery_id": row["battery_id"], "cycle_index": row["cycle_index"], "horizon_cycles": horizon, "survival_probability": float(probability), "prediction_created_at": evaluated_at, "split": row["split"]}
         for row, curve in zip(latest_rows, curves) for horizon, probability in zip(HORIZON_GRID, curve)
     ]
-    metadata = {"generation": plan["generation"], "model_fingerprint": plan["fingerprint"], "training_battery_count": plan["training_battery_count"], "as_of_cutoff": plan["cutoff"].isoformat(), "event_definition": "observed_eol_only", "censoring_definition": "cutoff_or_replay_end", "feature_version": FEATURE_VERSION, "landmark_sampling": plan["landmark_sampling"], "ipcw_support_policy": IPCW_SUPPORT_POLICY, "selected_family": winner["family"], "selected_config_id": winner["config_id"], "row_counts": {split: len(values) for split, values in by_split.items()}, "full_row_counts": full_row_counts, "event_rows": sum(row["event_observed"] for row in by_split["train"]), "censored_rows": sum(not row["event_observed"] for row in by_split["train"]), "generation_semantics_version": plan["generation_semantics_version"], "snapshot_id": plan["snapshot_id"], "finalized_cycle_boundary_fingerprint": plan["state_manifest"]["finalized_cycle_boundary_fingerprint"], "cohort_checksums": plan["cohort_checksums"], "arrived_train_battery_count": len(plan["arrived_train_battery_ids"]), "observed_eol_train_battery_count": len(plan["observed_eol_train_battery_ids"]), **({"native_threads": plan["native_threads"]} if plan.get("native_threads") is not None else {})}
+    metadata = {"generation": plan["generation"], "model_fingerprint": plan["fingerprint"], "training_battery_count": plan["training_battery_count"], "as_of_cutoff": plan["cutoff"].isoformat(), "event_definition": "observed_eol_only", "censoring_definition": "cutoff_or_replay_end", "feature_version": FEATURE_VERSION, "landmark_sampling": plan["landmark_sampling"], "ipcw_support_policy": IPCW_SUPPORT_POLICY, "selected_family": winner["family"], "selected_config_id": winner["config_id"], "row_counts": {split: len(values) for split, values in by_split.items()}, "full_row_counts": full_row_counts, "event_rows": sum(row["event_observed"] for row in by_split["train"]), "censored_rows": sum(not row["event_observed"] for row in by_split["train"]), "generation_semantics_version": plan["generation_semantics_version"], "snapshot_id": plan["snapshot_id"], "finalized_cycle_boundary_fingerprint": plan["state_manifest"]["finalized_cycle_boundary_fingerprint"], "cohort_checksums": plan["cohort_checksums"], "arrived_train_battery_count": len(plan["arrived_train_battery_ids"]), "observed_eol_train_battery_count": len(plan["observed_eol_train_battery_ids"]), **({"shared_feature_metadata": plan["shared_feature_metadata"]} if plan.get("shared_feature_metadata") else {}), **({"native_threads": plan["native_threads"]} if plan.get("native_threads") is not None else {})}
     if plan["generation_semantics_version"] == PROGRESSIVE_SEMANTICS_VERSION:
         metadata["record_class"] = plan["state_manifest"]["record_class"]
         metadata["progressive_arrival_registry"] = plan["state_manifest"]["progressive_arrival_registry"]
@@ -268,9 +302,11 @@ def parse_args():
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--manifest", type=Path, default=ROOT / "arrival_manifest.parquet")
     parser.add_argument("--lifecycle-events", type=Path, default=ROOT / "replay_lifecycle_state")
-    parser.add_argument("--state-manifest", type=Path, required=True)
-    parser.add_argument("--generation", required=True)
+    parser.add_argument("--state-manifest", type=Path)
+    parser.add_argument("--generation")
     parser.add_argument("--training-features", type=Path)
+    parser.add_argument("--receipt", type=Path, help="canonical immutable shared-generation receipt")
+    parser.add_argument("--offline-backfill", action="store_true", help="allow the explicit historical reconstruction path")
     parser.add_argument("--native-threads", type=int, help="limit native model workers for a bounded Airflow task")
     return parser.parse_args()
 
@@ -278,13 +314,17 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     manifest = pq.read_table(args.manifest).to_pylist()
-    state = json.loads(args.state_manifest.read_text())
-    plan = survival_generation_plan(manifest, state, args.generation)
+    if args.receipt and (args.state_manifest or args.generation or args.training_features or args.continuous):
+        raise SystemExit("--receipt cannot be combined with direct state, feature, or continuous arguments")
+    if bool(args.state_manifest) != bool(args.generation):
+        raise SystemExit("--state-manifest and --generation must be supplied together")
+    if not args.receipt and not (args.offline_backfill and args.state_manifest):
+        raise SystemExit("canonical training requires --receipt; use --offline-backfill for historical reconstruction")
+    plan = (plan_from_receipt(args.receipt, manifest) if args.receipt else
+            survival_generation_plan(manifest, json.loads(args.state_manifest.read_text()), args.generation))
     if args.training_features:
         plan["training_features_path"] = args.training_features
     if args.native_threads is not None:
         plan["native_threads"] = args.native_threads
     artifact = train_generation(plan)
-    if artifact and not args.state_manifest:
-        (ROOT / "latest_survival_candidate_generation.txt").write_text(str(artifact))
     print(f"Published survival candidate artifact {artifact}" if artifact else "No survival generation due.")

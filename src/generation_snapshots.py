@@ -10,11 +10,11 @@ import pyarrow.parquet as pq
 try:
     from .continuous_arrival import model_fingerprint
     from .feature_contract import RUL_FEATURES
-    from .stream_state import build_finalized_cycle_boundary, create_stream_state_manifest
+    from .stream_state import build_compact_finalized_cycle_boundary, create_stream_state_manifest
 except ImportError:
     from continuous_arrival import model_fingerprint
     from feature_contract import RUL_FEATURES
-    from stream_state import build_finalized_cycle_boundary, create_stream_state_manifest
+    from stream_state import build_compact_finalized_cycle_boundary, create_stream_state_manifest
 
 
 SEMANTICS_VERSION = "shared-stream-state-v2"
@@ -68,8 +68,8 @@ def build_generation_plan(generation, manifest, state_manifest, *, model_config,
                           cutoff=None, semantics_version=SEMANTICS_VERSION):
     """Create the one family-neutral plan consumed by both trainers."""
     _, default_cutoff = snapshot_definition(generation)
-    cutoff = _time(cutoff) if cutoff is not None else default_cutoff
     recorded_cutoff = (state_manifest.get("cutoff_metadata") or {}).get("replay_cutoff")
+    cutoff = _time(cutoff) if cutoff is not None else (_time(recorded_cutoff) if recorded_cutoff else default_cutoff)
     if recorded_cutoff and _time(recorded_cutoff) != cutoff:
         raise ValueError("state replay cutoff does not match generation snapshot")
     cohort = {key: list(state_manifest[key]) for key in ("arrived_train_battery_ids", "observed_eol_train_battery_ids", "censored_train_battery_ids")}
@@ -98,14 +98,15 @@ def reconstruct_snapshot(generation, *, root=Path("data/processed/matr")):
     lifecycle = pq.read_table(root / "replay_lifecycle_state").to_pylist()
     cohort = cohort_at_cutoff(manifest, lifecycle, cutoff)
     by_id = {row["battery_id"]: row for row in manifest}
+    canonical_keys = ds.dataset(root / "cycle_summary", format="parquet").to_table(columns=["dataset", "battery_id", "cycle_index"]).to_pylist()
     keys = []
-    for row in ds.dataset(root / "cycle_summary", format="parquet").to_table(columns=["dataset", "battery_id", "cycle_index"]).to_pylist():
+    for row in canonical_keys:
         source = by_id[row["battery_id"]]
         start = _time(source["start_time"])
         available = int((cutoff - start).days) + int(source.get("first_source_cycle", 1))
         if start <= cutoff and int(row["cycle_index"]) <= min(int(source["last_source_cycle"]), available):
-            keys.append({"dataset": row["dataset"], "battery_id": row["battery_id"], "cycle_index": int(row["cycle_index"])})
-    boundary = build_finalized_cycle_boundary(keys, canonical_fingerprint="matr-canonical-v1",
+            keys.append({"dataset": row["dataset"], "battery_id": row["battery_id"], "cycle_index": int(row["cycle_index"]), "replay_sequence": 0})
+    boundary = build_compact_finalized_cycle_boundary(keys, canonical_cycle_keys=canonical_keys, canonical_fingerprint="matr-canonical-v1",
         arrival_manifest_fingerprint=next(iter({row["schedule_fingerprint"] for row in manifest})),
         feature_contract_version="degradation-features:" + sha256(",".join(RUL_FEATURES).encode()).hexdigest())
     provisional = create_stream_state_manifest(boundary, boundary_ref="pending", eligible_completed_training_batteries=cohort["observed_eol_train_battery_ids"], cutoff_metadata={"replay_cutoff": cutoff.isoformat(), "generation": generation}, kafka_offsets={})

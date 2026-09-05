@@ -12,6 +12,13 @@ RUL_FEATURES = (
     "coulombic_efficiency", "early_cycle_capacity_delta",
 )
 
+# Persist only feature values that are not already authoritative in cycle_summary.
+SHARED_FEATURE_COLUMNS = (
+    "voltage_min_in_V", "voltage_max_in_V", "voltage_mean_in_V", "current_mean_in_A", "current_abs_max_in_A",
+    "prior_discharge_capacity_in_Ah", "capacity_fade_from_prior", "capacity_slope_10", "rolling_capacity_mean_10",
+    "coulombic_efficiency", "temperature_span_in_C", "charge_time_delta", "early_cycle_capacity_delta",
+)
+
 # Mergeable sufficient statistics shared with Structured Streaming.
 SUM_COUNT_FIELDS = {
     "voltage_in_V": ("_voltage_sum", "_voltage_count"),

@@ -104,6 +104,8 @@ def test_scheduled_replay_interleaves_batteries_and_emits_separate_lifecycle_eve
         (None, "early", 0), ("cycle_complete", "early", 1), ("replay_complete", "early", 2),
         (None, "late", 3), ("cycle_complete", "late", 4), ("eol_observed", "late", 5), ("replay_complete", "late", 6),
     ]
+    completions = [row for row in replay if row.get("event_type") == "cycle_complete"]
+    assert [row["expected_telemetry_rows"] for row in completions] == [1, 1]
     producer = FakeProducer()
     assert produce_rows(replay, producer, limit=0) == 7
     assert [record["topic"] for record in producer.produced].count(LIFECYCLE_TOPIC) == 5

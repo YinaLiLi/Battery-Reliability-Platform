@@ -17,8 +17,8 @@ def test_manifest_pointer_is_published_only_after_all_state_artifacts(tmp_path):
 
     state = manifest["state_id"]
     assert (tmp_path / "finalized_cycle_boundary" / state / "boundary.json").exists()
-    assert (tmp_path / "as_of_cycle_state" / state / "state.json").exists()
-    assert (tmp_path / "as_of_cycle_features" / state / "features.json").exists()
+    assert not (tmp_path / "as_of_cycle_state" / state).exists()
+    assert not (tmp_path / "as_of_cycle_features" / state).exists()
     assert json.loads((tmp_path / "stream_state" / "latest.json").read_text()) == manifest
 
 

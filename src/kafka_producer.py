@@ -56,15 +56,19 @@ def scheduled_replay_events(measurements, manifest, *, include_lifecycle=True):
         scheduled = schedule_measurement(row, by_battery[row["battery_id"]], replay_sequence=0)
         events.append((0, scheduled))
         key = (scheduled["battery_id"], scheduled["cycle_index"])
-        if key not in completed_cycles or scheduled["replay_event_time"] > completed_cycles[key]["replay_event_time"]:
-            completed_cycles[key] = scheduled
-    for scheduled in completed_cycles.values():
+        completed = completed_cycles.setdefault(key, {"last": scheduled, "count": 0})
+        completed["count"] += 1
+        if scheduled["replay_event_time"] > completed["last"]["replay_event_time"]:
+            completed["last"] = scheduled
+    for completed in completed_cycles.values():
+        scheduled = completed["last"]
         events.append((1, {
             "event_id": f"matr-lifecycle:{scheduled['battery_id']}:cycle_complete:{scheduled['cycle_index']}",
             "event_type": "cycle_complete",
             "dataset": scheduled["dataset"],
             "battery_id": scheduled["battery_id"],
             "cycle_index": scheduled["cycle_index"],
+            "expected_telemetry_rows": completed["count"],
             "replay_event_time": scheduled["replay_event_time"],
             "schema_version": "1.0",
         }))
