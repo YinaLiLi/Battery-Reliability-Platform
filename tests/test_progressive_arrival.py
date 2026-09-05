@@ -1,7 +1,5 @@
 from datetime import datetime, timezone
 
-import pyarrow.parquet as pq
-
 from src.progressive_arrival import (
     ARRIVAL_EPOCH,
     ARRIVAL_GAP_DAYS,
@@ -22,6 +20,24 @@ def _manifest():
     ]
 
 
+def _canonical_progressive_inputs():
+    """Minimal deterministic input for the published progressive cohorts."""
+    first_observed_at = [25] * 13 + [50] * 25 + [75] * 21 + [93] * 15
+    manifest = [
+        {"battery_id": f"train-{index}", "split": "train", "arrival_rank": index,
+         "start_time": "2010-01-01T00:00:00+00:00", "first_source_cycle": 1,
+         "last_source_cycle": 6000,
+         "eol_cycle": 60 * (first_observed_at[index] - index) + 1 if index < 74 else 1,
+         "valid_eol_label": index < 74}
+        for index in range(101)
+    ]
+    lifecycle = [
+        {"battery_id": f"train-{index}", "event_type": "eol_observed"}
+        for index in range(74)
+    ]
+    return manifest, lifecycle
+
+
 def test_schedule_uses_only_train_order_epoch_and_fixed_cadence():
     first, registry = schedule_manifest(_manifest())
     altered = [{**row, "valid_eol_label": not row["valid_eol_label"], "eol_cycle": 99} for row in _manifest()]
@@ -34,8 +50,7 @@ def test_schedule_uses_only_train_order_epoch_and_fixed_cadence():
 
 
 def test_current_manifest_dry_run_matches_predeclared_progressive_cohorts():
-    manifest = pq.read_table("data/processed/matr/arrival_manifest.parquet").to_pylist()
-    lifecycle = pq.read_table("data/processed/matr/replay_lifecycle_state").to_pylist()
+    manifest, lifecycle = _canonical_progressive_inputs()
     _, result = dry_run(manifest, lifecycle)
 
     assert {generation: row["arrived_train_battery_count"] for generation, row in result.items()} == GENERATION_ARRIVAL_COUNTS

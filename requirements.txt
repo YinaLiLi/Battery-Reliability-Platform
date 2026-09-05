@@ -1,6 +1,7 @@
 certifi==2026.7.22
 # Official interpreter range: >=3.10,<3.14. Pins preserve model reproducibility.
 pandas>=2.2,<3.1
+jinja2>=3.1,<4
 joblib==1.5.3
 psycopg[binary]>=3.2,<4
 charset-normalizer==3.5.1
