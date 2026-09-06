@@ -54,6 +54,18 @@ def soh_percent(soh):
     return round(soh * 100, 2)
 
 
+def filter_batteries_by_risk(fleet, battery_id, *, max_soh, max_rul):
+    """Apply optional maximum-risk thresholds without hiding missing values by default."""
+    filtered = fleet[fleet["battery_id"].str.contains(battery_id, case=False, na=False)]
+    soh = pd.to_numeric(filtered["measured_soh"], errors="coerce") * 100
+    if not soh.dropna().empty and max_soh < soh.max():
+        filtered = filtered[soh.notna() & (soh <= max_soh)]
+    rul = pd.to_numeric(filtered["predicted_rul_cycles"], errors="coerce")
+    if not rul.dropna().empty and max_rul < rul.max():
+        filtered = filtered[rul.notna() & (rul <= max_rul)]
+    return filtered
+
+
 def measured_soh_distribution(fleet, bin_width=5):
     """Count observed current-battery SOH measurements in fixed percentage bins."""
     values = pd.to_numeric(fleet["measured_soh"], errors="coerce").dropna() * 100
@@ -128,7 +140,6 @@ def model_metrics(evaluation):
     validation = metrics.get("validation", {})
     stage = metrics.get("lifecycle_stage_mae", {})
     metadata = evaluation.get("training_metadata") or {}
-    training_data = metadata.get("training_data_version", "Not recorded")
     return {
         "Model version": evaluation["model_version"],
         "Generation": evaluation.get("generation") or metadata.get("generation", "Not recorded"),
@@ -144,7 +155,6 @@ def model_metrics(evaluation):
         "Early MAE": stage.get("early"),
         "Mid MAE": stage.get("mid"),
         "Late MAE": stage.get("late"),
-        "Training data": training_data,
     }
 
 

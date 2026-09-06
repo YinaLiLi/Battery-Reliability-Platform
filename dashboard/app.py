@@ -1,5 +1,4 @@
 """Read-only Streamlit views over PostgreSQL analytics serving tables."""
-import json
 import os
 
 import altair as alt
@@ -8,7 +7,7 @@ import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
 
-from src.dashboard_data import family_label, family_validation_rows, lifecycle_stage, latest_model_version, measured_soh_distribution, model_display_names, model_metrics, performance_gradient, selectable_models, soh_percent, survival_family_validation_rows, survival_model_metrics
+from src.dashboard_data import family_label, family_validation_rows, filter_batteries_by_risk, lifecycle_stage, latest_model_version, measured_soh_distribution, model_display_names, model_metrics, performance_gradient, selectable_models, soh_percent, survival_family_validation_rows, survival_model_metrics
 
 
 @st.cache_resource
@@ -208,11 +207,11 @@ def fleet_page():
         filters = st.columns(3)
         search = filters[0].text_input("Battery ID")
         measured_soh = fleet["measured_soh"].map(soh_percent)
-        min_soh = filters[1].number_input(
-            "Minimum SOH (%)",
+        max_soh = filters[1].number_input(
+            "Maximum SOH (%)",
             min_value=float(measured_soh.min()),
             max_value=float(measured_soh.max()),
-            value=float(measured_soh.min()),
+            value=float(measured_soh.max()),
             step=1.0,
         )
         available_rul = fleet["predicted_rul_cycles"].dropna()
@@ -224,10 +223,12 @@ def fleet_page():
             value=available_rul_max,
             step=1.0,
         )
-    filtered = fleet[fleet["battery_id"].str.contains(search, case=False, na=False)]
-    filtered = filtered[filtered["measured_soh"].map(soh_percent) >= min_soh]
-    if selected_version:
-        filtered = filtered[filtered["predicted_rul_cycles"].fillna(float("inf")) <= max_rul]
+    filtered = filter_batteries_by_risk(
+        fleet,
+        search,
+        max_soh=max_soh,
+        max_rul=max_rul if selected_version else float("inf"),
+    )
     filtered = filtered.assign(lifecycle_stage=[lifecycle_stage(row.current_cycle, row.predicted_rul_cycles) for row in filtered.itertuples()])
     filtered["measured_soh_percent"] = filtered["measured_soh"].map(soh_percent)
     visible = filtered.rename(
@@ -241,13 +242,19 @@ def fleet_page():
             "prediction_created_at": "Prediction timestamp",
         }
     )
+    visible["Predicted RUL (cycles)"] = visible["Predicted RUL (cycles)"].round()
+    visible["Estimated EOL cycle"] = visible["Estimated EOL cycle"].round()
     event = st.dataframe(
         visible[["Battery", "Current cycle", "Measured SOH (%)", "Predicted RUL (cycles)", "Estimated EOL cycle", "Lifecycle stage", "Prediction timestamp"]],
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
         width="stretch",
-        column_config={"Measured SOH (%)": st.column_config.NumberColumn(format="%.1f")},
+        column_config={
+            "Measured SOH (%)": st.column_config.NumberColumn(format="%.1f"),
+            "Predicted RUL (cycles)": st.column_config.NumberColumn(format="%.0f"),
+            "Estimated EOL cycle": st.column_config.NumberColumn(format="%.0f"),
+        },
     )
     if event.selection.rows:
         st.session_state.battery_id = filtered.iloc[event.selection.rows[0]].battery_id
@@ -335,7 +342,6 @@ def battery_page():
         st.info("No model prediction history is available.")
         return
     selected = selected_version
-    selected_status = selected_model["status"]
     predictions = pd.DataFrame(rows(
         """
         SELECT cycle_index, raw_predicted_rul_cycles, predicted_rul_cycles, predicted_eol_cycle
@@ -345,28 +351,33 @@ def battery_page():
         """,
         {"model_version": selected, "dataset": latest.dataset, "battery_id": battery_id},
     ))
-    st.subheader("ML-predicted RUL history")
-    st.caption(f"{model_names.get(selected, selected)} · internal version: {selected}. Selected model status: {selected_status}.")
+    st.subheader("Predicted RUL history")
+    st.caption(f"Current model: {model_names.get(selected, selected)}.")
     if predictions.empty:
         st.info("This model has no prediction history for the selected battery.")
     else:
         first_eol = predictions.loc[predictions["predicted_rul_cycles"] == 0, "cycle_index"].min()
         predictions["estimated_eol_cycle"] = predictions["predicted_eol_cycle"].where(predictions["cycle_index"] <= first_eol) if pd.notna(first_eol) else predictions["predicted_eol_cycle"]
         history = predictions.melt("cycle_index", ["predicted_rul_cycles", "estimated_eol_cycle"], var_name="series", value_name="cycles").dropna()
-        chart = alt.Chart(history).mark_line().encode(x="cycle_index:Q", y="cycles:Q", color="series:N")
+        history["series"] = history["series"].map({"predicted_rul_cycles": "Predicted RUL", "estimated_eol_cycle": "Estimated EOL cycle"})
+        chart = alt.Chart(history).mark_line().encode(
+            x=alt.X("cycle_index:Q", title="Cycle"),
+            y=alt.Y("cycles:Q", title="Cycles"),
+            color=alt.Color("series:N", title=None),
+        )
         if pd.notna(first_eol):
             marker = predictions.loc[predictions["cycle_index"] == first_eol]
             chart += alt.Chart(marker).mark_point(color="#d62728", filled=True, size=90).encode(x="cycle_index:Q", y="predicted_eol_cycle:Q")
         st.altair_chart(chart, width="stretch")
         if pd.notna(first_eol):
-            st.caption(f"Predicted EOL reached at cycle {int(first_eol)}; the served EOL is frozen there.")
+            st.caption(f"Predicted EOL reached at cycle {int(first_eol)}; EOL remains at that cycle thereafter.")
         with st.expander("Raw model diagnostics"):
             st.caption("Raw model output is retained for diagnostics only; charts above use operational served predictions.")
             st.dataframe(predictions[["cycle_index", "raw_predicted_rul_cycles"]], hide_index=True, width="stretch")
 
 
 def model_page():
-    st.header("Model monitoring")
+    st.header("RUL model monitoring")
     models = evaluations()
     if not models:
         st.info("No model evaluations are available.")
@@ -378,6 +389,7 @@ def model_page():
         st.info("No non-retired canonical model generations are available for monitoring.")
         return
     versions = [model["model_version"] for model in active]
+    st.subheader("Current model")
     if selected_model:
         st.selectbox(
             "Current model",
@@ -387,24 +399,51 @@ def model_page():
             on_change=persist_current_model,
             args=(selected_model["dataset"],),
             format_func=lambda version: model_names.get(version, version),
-    )
-    st.caption("The Current model is selected for dashboard analysis; database audit statuses are unchanged.")
+            label_visibility="collapsed",
+        )
+    st.caption("Current is the serving model. Model selection uses validation metrics only; test metrics are held-out evaluation.")
     flattened = pd.DataFrame([model_metrics(model) for model in active])
     flattened.insert(0, "Display model", [model_names.get(model["model_version"], model["model_version"]) for model in active])
-    flattened = flattened.rename(columns={"Model version": "Internal model version"})
+    flattened = flattened.drop(columns=["Model version", "Model fingerprint"], errors="ignore")
     flattened.insert(1, "Selection", ["Current" if model.get("model_version") == st.session_state.get("current_model_version") else "" for model in active])
+    st.subheader("Model performance comparison")
     st.dataframe(
         performance_gradient(
-            flattened,
+            flattened[["Display model", "Selection", "Generation", "Selected model family", "Validation MAE", "Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"]],
             lower_is_better=["Validation MAE", "Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"],
-            higher_is_better=["Test R²"],
         ),
         hide_index=True,
         width="stretch",
+        column_config={
+            "Validation MAE": st.column_config.NumberColumn(format="%.1f"),
+            "Test MAE": st.column_config.NumberColumn(format="%.1f"),
+            "Test RMSE": st.column_config.NumberColumn(format="%.1f"),
+            "Early MAE": st.column_config.NumberColumn(format="%.1f"),
+            "Mid MAE": st.column_config.NumberColumn(format="%.1f"),
+            "Late MAE": st.column_config.NumberColumn(format="%.1f"),
+        },
     )
+    errors = flattened.melt(
+        id_vars=["Display model"],
+        value_vars=["Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"],
+        var_name="Metric",
+        value_name="Cycles of error",
+    )
+    st.altair_chart(
+        alt.Chart(errors).mark_bar().encode(
+            x=alt.X("Metric:N", sort=["Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"], title="Error metric"),
+            y=alt.Y("Cycles of error:Q", title="Cycles"),
+            xOffset="Display model:N",
+            color=alt.Color("Display model:N", title="Model"),
+            tooltip=["Display model", "Metric", "Cycles of error"],
+        ),
+        width="stretch",
+    )
+    st.caption("MAE: average absolute error in cycles (↓ better) · RMSE: penalizes larger errors more heavily (↓ better) · Lifecycle MAE: error by early/mid/late battery life (↓ better).")
 
+    st.subheader("Validation comparison")
     generation_version = st.selectbox(
-        "Generation validation comparison",
+        "Generation",
         [model["model_version"] for model in active],
         format_func=lambda version: model_names.get(version, version),
     )
@@ -413,7 +452,6 @@ def model_page():
     if family_validation.empty:
         st.info("This legacy evaluation does not contain family-level validation results.")
     else:
-        st.caption("Family and configuration selection use validation data only. The selected family is marked below.")
         st.dataframe(
             performance_gradient(
                 family_validation,
@@ -422,6 +460,11 @@ def model_page():
             ),
             hide_index=True,
             width="stretch",
+            column_config={
+                "Validation MAE": st.column_config.NumberColumn(format="%.1f"),
+                "Validation RMSE": st.column_config.NumberColumn(format="%.1f"),
+                "Validation R²": st.column_config.NumberColumn(format="%.3f"),
+            },
         )
         st.altair_chart(
             alt.Chart(family_validation).mark_bar().encode(
@@ -433,76 +476,17 @@ def model_page():
             width="stretch",
         )
 
-    st.subheader("Metric definitions")
-    st.markdown(
-        """- Test MAE — On average, how many cycles the prediction is off by; lower is better.
-- Test RMSE — Similar to MAE, but gives more weight to large prediction errors; lower is better.
-- Lifecycle MAE — Shows how prediction error changes from early to mid to late battery life; lower is better.
-- R² — How well the model explains differences in remaining battery life; closer to 1 is better."""
-    )
-
-    if not active:
-        st.info("No model is available for comparison.")
-        return
-    baseline = selected_model or active[-1]
-    candidate_options = [model["model_version"] for model in active if model["model_version"] != baseline["model_version"]]
-    selected_candidates = st.multiselect(
-        "Add models to compare",
-        options=candidate_options,
-        default=[],
-        format_func=lambda version: model_names.get(version, version),
-        max_selections=4,
-        help="The Current model is always included.",
-    )
-    selected_versions = [baseline["model_version"], *selected_candidates]
-    selected_models = [model for model in active if model["model_version"] in selected_versions]
-    if not selected_models:
-        return
-
-    comparison = pd.DataFrame([model_metrics(model) for model in selected_models])
-    comparison["Display model"] = [model_names.get(model["model_version"], model["model_version"]) for model in selected_models]
-    if len(selected_versions) > 1:
-        errors = comparison.melt(
-            id_vars=["Display model"],
-            value_vars=["Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"],
-            var_name="Metric",
-            value_name="Cycles of error",
-        )
-        st.subheader("Error metric comparison")
-        st.caption("Lower is better")
-        st.altair_chart(
-            alt.Chart(errors).mark_bar().encode(
-                x=alt.X("Metric:N", sort=["Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"]),
-                y="Cycles of error:Q",
-                xOffset="Display model:N",
-                color="Display model:N",
-            ),
-            width="stretch",
-        )
-
     st.subheader("R² comparison")
-    st.caption("Higher is better")
-    r2 = comparison[["Display model", "Test R²"]].rename(columns={"Test R²": "R²"})
-    st.dataframe(r2, hide_index=True, width="stretch")
-
-    st.subheader("Model metadata")
-    for model in selected_models:
-        display_name = model_names.get(model["model_version"], model["model_version"])
-        heading = f"{display_name} ({model['status']})"
-        with st.expander(heading):
-            st.markdown(f"**Internal model version:** `{model['model_version']}`")
-            st.markdown(f"**Status:** {model['status']}")
-            st.markdown(f"**Evaluation timestamp:** {model['evaluated_at']}")
-            st.markdown(f"**Validation MAE:** {model_metrics(model)['Validation MAE']:.4f}")
-            st.markdown(f"**Test MAE:** {model_metrics(model)['Test MAE']:.4f}")
-            st.markdown(f"**RMSE:** {model_metrics(model)['Test RMSE']:.4f}")
-            st.markdown(f"**R²:** {model_metrics(model)['Test R²']:.4f}")
-            st.markdown(f"**Early lifecycle MAE:** {model_metrics(model)['Early MAE']:.4f}")
-            st.markdown(f"**Mid lifecycle MAE:** {model_metrics(model)['Mid MAE']:.4f}")
-            st.markdown(f"**Late lifecycle MAE:** {model_metrics(model)['Late MAE']:.4f}")
-            if model.get("training_metadata"):
-                st.markdown("**Training metadata:**")
-                st.json(model["training_metadata"])
+    st.dataframe(
+        performance_gradient(
+            flattened[["Display model", "Selection", "Test R²"]].rename(columns={"Test R²": "R²"}),
+            higher_is_better=["R²"],
+        ),
+        hide_index=True,
+        width="stretch",
+        column_config={"R²": st.column_config.NumberColumn(format="%.3f")},
+    )
+    st.caption("R²: explained variation (↑ better).")
 
 
 def survival_model_page():
@@ -516,26 +500,41 @@ def survival_model_page():
     model_names = model_display_names(models)
     versions = [model["model_version"] for model in models]
     selected_version = selected["model_version"]
-    selected_version = st.selectbox("Current survival model", versions, index=versions.index(selected_version), key="current_survival_model_version", on_change=persist_current_survival_model, args=(models[0]["dataset"],), format_func=lambda version: model_names.get(version, version))
+    st.subheader("Current model")
+    selected_version = st.selectbox("Current survival model", versions, index=versions.index(selected_version), key="current_survival_model_version", on_change=persist_current_survival_model, args=(models[0]["dataset"],), format_func=lambda version: model_names.get(version, version), label_visibility="collapsed")
     selected = next(model for model in models if model["model_version"] == selected_version)
-    st.caption("Survival models estimate conditional probabilities; they do not change RUL selection or metrics.")
+    st.caption("Current survival model governs survival curves only; RUL uses the separate Current model. Validation selects candidate models; test metrics are held-out evaluation only.")
     flattened = pd.DataFrame([survival_model_metrics(model) for model in models])
     flattened.insert(0, "Display model", [model_names[model["model_version"]] for model in models])
-    flattened = flattened.rename(columns={"Model version": "Internal model version"})
+    flattened = flattened.drop(columns=["Model version"], errors="ignore")
     flattened.insert(1, "Selection", ["Current" if model["model_version"] == selected_version else "" for model in models])
+    st.subheader("Model performance comparison")
     st.dataframe(
         performance_gradient(
-            flattened,
+            flattened[["Display model", "Selection", "Generation", "Selected model family", "Validation IBS", "Validation IPCW C-index", "Test IBS", "Test IPCW C-index"]],
             lower_is_better=["Validation IBS", "Test IBS"],
             higher_is_better=["Validation IPCW C-index", "Test IPCW C-index"],
         ),
         hide_index=True,
         width="stretch",
+        column_config={
+            "Validation IBS": st.column_config.NumberColumn(format="%.3f"),
+            "Validation IPCW C-index": st.column_config.NumberColumn(format="%.3f"),
+            "Test IBS": st.column_config.NumberColumn(format="%.3f"),
+            "Test IPCW C-index": st.column_config.NumberColumn(format="%.3f"),
+        },
     )
-    comparison = pd.DataFrame(survival_family_validation_rows(selected))
+    st.caption("IBS: integrated probability error (↓ better) · IPCW C-index: censoring-adjusted risk ranking (↑ better). Model selection uses validation metrics only; test metrics are held-out evaluation.")
+    st.subheader("Validation comparison")
+    generation_version = st.selectbox(
+        "Generation",
+        [model["model_version"] for model in models],
+        index=versions.index(selected_version),
+        format_func=lambda version: model_names.get(version, version),
+    )
+    generation_model = next(model for model in models if model["model_version"] == generation_version)
+    comparison = pd.DataFrame(survival_family_validation_rows(generation_model))
     if not comparison.empty:
-        st.subheader("Family validation comparison")
-        st.caption("Family and configuration selection use validation data only; the selected family is marked below.")
         st.dataframe(
             performance_gradient(
                 comparison,
@@ -544,27 +543,11 @@ def survival_model_page():
             ),
             hide_index=True,
             width="stretch",
+            column_config={
+                "Validation IBS": st.column_config.NumberColumn(format="%.3f"),
+                "Validation IPCW C-index": st.column_config.NumberColumn(format="%.3f"),
+            },
         )
-    test = json.loads(selected["metrics"]) if isinstance(selected["metrics"], str) else selected["metrics"]
-    winner_test = test.get("test", {})
-    st.subheader("Winner fixed-test metrics")
-    winner_test_frame = pd.DataFrame([{
-        "Model family": family_label(selected["model_name"]),
-        "Test IBS": winner_test.get("integrated_brier_score"),
-        "Test IPCW C-index": winner_test.get("ipcw_c_index"),
-        "+50 Brier": winner_test.get("horizon_brier", {}).get("50"),
-        "+100 Brier": winner_test.get("horizon_brier", {}).get("100"),
-        "+200 Brier": winner_test.get("horizon_brier", {}).get("200"),
-    }])
-    st.dataframe(
-        performance_gradient(
-            winner_test_frame,
-            lower_is_better=["Test IBS", "+50 Brier", "+100 Brier", "+200 Brier"],
-            higher_is_better=["Test IPCW C-index"],
-        ),
-        hide_index=True,
-        width="stretch",
-    )
 
 
 st.set_page_config(page_title="Battery reliability monitoring", layout="wide")

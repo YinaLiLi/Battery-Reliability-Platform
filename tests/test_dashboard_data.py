@@ -3,6 +3,7 @@ import json
 import pandas as pd
 
 from src.dashboard_data import (
+    filter_batteries_by_risk,
     lifecycle_stage,
     lowest_rows,
     measured_soh_distribution,
@@ -54,7 +55,6 @@ def test_model_metrics_flattens_evaluation_and_keeps_missing_training_metadata_u
         "Early MAE": 18.0,
         "Mid MAE": 12.0,
         "Late MAE": 7.0,
-        "Training data": "Not recorded",
     }
 
 
@@ -174,6 +174,19 @@ def test_latest_model_version_does_not_hard_code_generation_1_2():
 
 def test_soh_percent_converts_measured_fraction_for_display():
     assert soh_percent(0.7301) == 73.01
+
+
+def test_risk_filters_use_inclusive_maximums_and_keep_the_default_population():
+    fleet = pd.DataFrame(
+        {
+            "battery_id": ["healthy", "risk", "unknown"],
+            "measured_soh": [0.90, 0.60, None],
+            "predicted_rul_cycles": [100.0, 20.0, None],
+        }
+    )
+
+    assert filter_batteries_by_risk(fleet, "", max_soh=90, max_rul=100)["battery_id"].tolist() == ["healthy", "risk", "unknown"]
+    assert filter_batteries_by_risk(fleet, "", max_soh=60, max_rul=20)["battery_id"].tolist() == ["risk"]
 
 
 def test_measured_soh_distribution_counts_current_batteries_in_fixed_nonempty_bins():
