@@ -122,6 +122,16 @@ def test_selectable_models_prefers_shared_progressive_arrival_v3():
     assert [model["model_version"] for model in selectable_models(models)] == ["arrival-v3"]
 
 
+def test_selectable_models_keeps_the_persisted_current_artifact_for_its_generation():
+    models = [
+        {"model_version": "current-1.2", "status": "candidate", "model_name": "xgboost", "evaluated_at": "2026-09-01", "generation": "1.2", "training_metadata": {"selected_family": "xgboost"}},
+        {"model_version": "canonical-1.2", "status": "candidate", "model_name": "xgboost", "evaluated_at": "2026-09-03", "generation": "1.2", "training_metadata": {"selected_family": "xgboost", "record_class": "canonical_shared_progressive_arrival_v3"}},
+        {"model_version": "canonical-1.3", "status": "candidate", "model_name": "mlp", "evaluated_at": "2026-09-04", "generation": "1.3", "training_metadata": {"selected_family": "mlp", "record_class": "canonical_shared_progressive_arrival_v3"}},
+    ]
+
+    assert [model["model_version"] for model in selectable_models(models, current_version="current-1.2")] == ["current-1.2", "canonical-1.3"]
+
+
 def test_model_metrics_exposes_generation_selection_and_family_validation_results():
     evaluation = {
         "model_version": "model-1-2",
@@ -151,6 +161,15 @@ def test_selectable_models_exclude_retired_and_best_fixed_test_mae_is_default():
     ]
     assert [model["model_version"] for model in selectable_models(models)] == ["v1", "v2", "v3"]
     assert latest_model_version(models) == "v2"
+
+
+def test_latest_model_version_does_not_hard_code_generation_1_2():
+    models = [
+        {"model_version": "v1.2", "status": "candidate", "training_metadata": {"generation": "1.2"}, "metrics": {"test": {"mae": 40.91}}},
+        {"model_version": "v1.3", "status": "candidate", "training_metadata": {"generation": "1.3"}, "metrics": {"test": {"mae": 39.41}}},
+    ]
+
+    assert latest_model_version(models) == "v1.3"
 
 
 def test_soh_percent_converts_measured_fraction_for_display():

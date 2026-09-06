@@ -99,6 +99,16 @@ CREATE TABLE IF NOT EXISTS analytics.survival_model_evaluations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS survival_model_evaluations_one_champion_per_dataset_idx ON analytics.survival_model_evaluations (dataset) WHERE status = 'champion';
 
+CREATE TABLE IF NOT EXISTS analytics.current_models (
+    dataset TEXT PRIMARY KEY,
+    model_version TEXT NOT NULL REFERENCES analytics.model_evaluations (model_version),
+    model_fingerprint TEXT,
+    selection_revision INTEGER NOT NULL DEFAULT 1 CHECK (selection_revision > 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE analytics.current_models
+    ADD COLUMN IF NOT EXISTS model_fingerprint TEXT;
+
 DROP VIEW IF EXISTS analytics.dashboard_battery_latest;
 CREATE VIEW analytics.dashboard_battery_latest AS
 WITH latest_health AS (
@@ -107,10 +117,6 @@ WITH latest_health AS (
         internal_resistance_in_ohm, temperature_max_in_c, capacity_slope_10
     FROM analytics.battery_cycle_health
     ORDER BY dataset, battery_id, cycle_index DESC
-), champion AS (
-    SELECT dataset, model_version
-    FROM analytics.model_evaluations
-    WHERE status = 'champion'
 )
 SELECT
     health.dataset,
@@ -121,28 +127,18 @@ SELECT
     health.internal_resistance_in_ohm,
     health.temperature_max_in_c,
     health.capacity_slope_10,
-    champion.model_version AS champion_model_version,
+    current.model_version AS current_model_version,
     prediction.predicted_rul_cycles AS predicted_rul_cycles,
     prediction.predicted_eol_cycle,
     prediction.prediction_created_at,
     prediction.predicted_eol_cycle AS estimated_eol_cycle
 FROM latest_health AS health
-LEFT JOIN champion ON champion.dataset = health.dataset
+LEFT JOIN analytics.current_models AS current ON current.dataset = health.dataset
 LEFT JOIN analytics.battery_predictions AS prediction
-    ON prediction.model_version = champion.model_version
+    ON prediction.model_version = current.model_version
     AND prediction.dataset = health.dataset
     AND prediction.battery_id = health.battery_id
     AND prediction.cycle_index = health.cycle_index;
-
-CREATE TABLE IF NOT EXISTS analytics.current_models (
-    dataset TEXT PRIMARY KEY,
-    model_version TEXT NOT NULL REFERENCES analytics.model_evaluations (model_version),
-    model_fingerprint TEXT,
-    selection_revision INTEGER NOT NULL DEFAULT 1 CHECK (selection_revision > 0),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-ALTER TABLE analytics.current_models
-    ADD COLUMN IF NOT EXISTS model_fingerprint TEXT;
 
 CREATE TABLE IF NOT EXISTS analytics.current_survival_models (
     dataset TEXT PRIMARY KEY,

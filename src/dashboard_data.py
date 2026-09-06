@@ -218,7 +218,7 @@ def family_validation_rows(evaluation):
     ]
 
 
-def selectable_models(models):
+def selectable_models(models, current_version=None):
     """Return non-retired generations in display order."""
     active = [model for model in models if model.get("status") != "retired"]
     generations = {}
@@ -255,6 +255,9 @@ def selectable_models(models):
             continue
         if next_is_neutral == current_is_neutral and model.get("evaluated_at") > current.get("evaluated_at", ""):
             generations[generation] = model
+    current = next((model for model in active if model.get("model_version") == current_version), None)
+    if current is not None and _model_generation(current) is not None:
+        generations[_model_generation(current)] = current
     selected = list(generations.values())
     names = model_display_names(active)
     return sorted(selected, key=lambda model: names.get(model["model_version"], model["model_version"]))
@@ -265,10 +268,6 @@ def latest_model_version(models):
     active = selectable_models(models)
     if not active:
         return None
-    preferred = next((model for model in active if str(_model_generation(model)) == "1.2"), None)
-    if preferred is not None:
-        return preferred["model_version"]
-
     def test_mae(model):
         metrics = model.get("metrics") or {}
         if isinstance(metrics, str):

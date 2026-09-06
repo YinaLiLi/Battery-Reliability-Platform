@@ -63,6 +63,8 @@ def persist_current_model(dataset):
             {"dataset": dataset, "model_version": model_version},
         )
     database().commit()
+    serving_rows.clear()
+    rows.clear()
 
 
 def evaluations():
@@ -77,41 +79,18 @@ def evaluations():
 
 
 def current_model(models):
-    models = selectable_models(models)
     if not models:
         return None
+    persisted = serving_rows("SELECT model_version FROM analytics.current_models WHERE dataset = %(dataset)s", {"dataset": models[0]["dataset"]})
+    persisted_version = persisted[0]["model_version"] if persisted else None
+    models = selectable_models(models, current_version=persisted_version)
     versions = [model["model_version"] for model in models]
-    selected = st.session_state.get("current_model_version")
+    selected = persisted_version or st.session_state.get("current_model_version")
     if selected not in versions:
         selected = latest_model_version(models)
+    if st.session_state.get("current_model_version") != selected:
         st.session_state.current_model_version = selected
     return next(model for model in models if model["model_version"] == selected)
-
-
-def model_predictions(dataset, model_version):
-    return pd.DataFrame(rows(
-        """
-        SELECT DISTINCT ON (battery_id) battery_id, predicted_rul_cycles,
-               predicted_eol_cycle AS estimated_eol_cycle, prediction_created_at
-        FROM analytics.battery_predictions
-        WHERE dataset = %(dataset)s AND model_version = %(model_version)s
-        ORDER BY battery_id, cycle_index DESC
-        """,
-        {"dataset": dataset, "model_version": model_version},
-    ))
-
-
-def current_model_predictions(dataset, model_version):
-    # Keep merge keys available when the current serving table has not been scored.
-    return pd.DataFrame(rows(
-        """
-        SELECT battery_id, predicted_rul_cycles, predicted_eol_cycle AS estimated_eol_cycle,
-               inference_created_at AS prediction_created_at
-        FROM analytics.battery_current_predictions
-        WHERE dataset = %(dataset)s AND model_version = %(model_version)s
-        """,
-        {"dataset": dataset, "model_version": model_version},
-    ), columns=["battery_id", "predicted_rul_cycles", "estimated_eol_cycle", "prediction_created_at"])
 
 
 def survival_evaluations():
@@ -140,16 +119,20 @@ def persist_current_survival_model(dataset):
             {"dataset": dataset, "model_version": model_version},
         )
     database().commit()
+    serving_rows.clear()
 
 
 def current_survival_model(models):
     if not models:
         return None
+    persisted = serving_rows("SELECT model_version FROM analytics.current_survival_models WHERE dataset = %(dataset)s", {"dataset": models[0]["dataset"]})
+    persisted_version = persisted[0]["model_version"] if persisted else None
+    models = selectable_models(models, current_version=persisted_version)
     versions = [model["model_version"] for model in models]
-    persisted = rows("SELECT model_version FROM analytics.current_survival_models WHERE dataset = %(dataset)s", {"dataset": models[0]["dataset"]})
-    selected = persisted[0]["model_version"] if persisted else st.session_state.get("current_survival_model_version", versions[0])
+    selected = persisted_version or st.session_state.get("current_survival_model_version", versions[0])
     if selected not in versions:
         selected = versions[0]
+    if st.session_state.get("current_survival_model_version") != selected:
         st.session_state.current_survival_model_version = selected
     return next(model for model in models if model["model_version"] == selected)
 
@@ -183,7 +166,7 @@ def fleet_page():
     selected_name = model_display_names(models).get(selected_version, "Unavailable")
 
     st.subheader("Current model")
-    active = selectable_models(models)
+    active = selectable_models(models, current_version=selected_version)
     versions = [model["model_version"] for model in active]
     if versions:
         st.selectbox(
@@ -200,11 +183,7 @@ def fleet_page():
     selected_version = selected_model["model_version"] if selected_model else None
     selected_name = model_display_names(models).get(selected_version, "Unavailable")
 
-    rul_predictions_available = 0
-    if selected_version:
-        prediction_frame = current_model_predictions(fleet.iloc[0]["dataset"], selected_version)
-        fleet = fleet.drop(columns=["predicted_rul_cycles", "predicted_eol_cycle", "estimated_eol_cycle", "prediction_created_at"], errors="ignore").merge(prediction_frame, on="battery_id", how="left")
-        rul_predictions_available = int(fleet["predicted_rul_cycles"].notna().sum())
+    rul_predictions_available = int(fleet["predicted_rul_cycles"].notna().sum())
 
     metric_row = st.columns(4)
     metric_row[0].metric("Batteries tracked", len(fleet))
@@ -290,17 +269,8 @@ def battery_page():
     selected_model = current_model(models)
     selected_version = selected_model["model_version"] if selected_model else None
     selected_name = model_names.get(selected_version, "Unavailable")
-    selected_prediction = rows(
-        """
-        SELECT predicted_rul_cycles, predicted_eol_cycle
-        FROM analytics.battery_current_predictions
-        WHERE model_version = %(model_version)s AND dataset = %(dataset)s AND battery_id = %(battery_id)s
-        ORDER BY cycle_index DESC LIMIT 1
-        """,
-        {"model_version": selected_version, "dataset": latest.dataset, "battery_id": battery_id},
-    ) if selected_version else []
-    latest_rul = selected_prediction[0]["predicted_rul_cycles"] if selected_prediction else None
-    latest_eol = selected_prediction[0]["predicted_eol_cycle"] if selected_prediction else None
+    latest_rul = latest.predicted_rul_cycles if selected_version else None
+    latest_eol = latest.predicted_eol_cycle if selected_version else None
     cards = st.columns(5)
     cards[0].metric("Current cycle", int(latest.current_cycle))
     cards[1].metric("Measured SOH", f"{latest.measured_soh:.1%}")
@@ -401,12 +371,12 @@ def model_page():
     if not models:
         st.info("No model evaluations are available.")
         return
-    active = selectable_models(models)
+    selected_model = current_model(models)
+    active = selectable_models(models, current_version=selected_model["model_version"] if selected_model else None)
     model_names = model_display_names(active)
     if not active:
         st.info("No non-retired canonical model generations are available for monitoring.")
         return
-    selected_model = current_model(models)
     versions = [model["model_version"] for model in active]
     if selected_model:
         st.selectbox(
@@ -538,26 +508,31 @@ def model_page():
 def survival_model_page():
     st.header("Survival model monitoring")
     all_models = survival_evaluations()
-    models = selectable_models(all_models)
-    if not models:
+    selected = current_survival_model(all_models)
+    models = selectable_models(all_models, current_version=selected["model_version"] if selected else None)
+    if not models or not selected:
         st.info("No survival model evaluations are available.")
         return
-    selected = current_survival_model(all_models)
+    model_names = model_display_names(models)
     versions = [model["model_version"] for model in models]
-    selected_version = selected["model_version"] if selected and selected["model_version"] in versions else versions[0]
-    st.selectbox("Current survival model", versions, index=versions.index(selected_version), key="current_survival_model_version", on_change=persist_current_survival_model, args=(models[0]["dataset"],), format_func=lambda version: next(f"Model {model.get('generation')} — {family_label(model['model_name'])}" for model in models if model["model_version"] == version))
+    selected_version = selected["model_version"]
+    selected_version = st.selectbox("Current survival model", versions, index=versions.index(selected_version), key="current_survival_model_version", on_change=persist_current_survival_model, args=(models[0]["dataset"],), format_func=lambda version: model_names.get(version, version))
+    selected = next(model for model in models if model["model_version"] == selected_version)
     st.caption("Survival models estimate conditional probabilities; they do not change RUL selection or metrics.")
+    flattened = pd.DataFrame([survival_model_metrics(model) for model in models])
+    flattened.insert(0, "Display model", [model_names[model["model_version"]] for model in models])
+    flattened = flattened.rename(columns={"Model version": "Internal model version"})
+    flattened.insert(1, "Selection", ["Current" if model["model_version"] == selected_version else "" for model in models])
     st.dataframe(
         performance_gradient(
-            pd.DataFrame([survival_model_metrics(model) for model in models]),
+            flattened,
             lower_is_better=["Validation IBS", "Test IBS"],
             higher_is_better=["Validation IPCW C-index", "Test IPCW C-index"],
         ),
         hide_index=True,
         width="stretch",
     )
-    comparison_model = next((model for model in models if model["model_version"] == selected_version), models[0])
-    comparison = pd.DataFrame(survival_family_validation_rows(comparison_model))
+    comparison = pd.DataFrame(survival_family_validation_rows(selected))
     if not comparison.empty:
         st.subheader("Family validation comparison")
         st.caption("Family and configuration selection use validation data only; the selected family is marked below.")
