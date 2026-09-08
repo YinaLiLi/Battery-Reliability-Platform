@@ -7,7 +7,7 @@ import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
 
-from src.dashboard_data import family_label, family_validation_rows, filter_batteries_by_risk, lifecycle_stage, latest_model_version, measured_soh_distribution, model_display_names, model_metrics, performance_gradient, selectable_models, soh_percent, survival_family_validation_rows, survival_model_metrics
+from src.dashboard_data import current_survival_curve, family_validation_rows, filter_batteries_by_risk, fleet_descriptive_kpis, lifecycle_stage, latest_model_version, measured_soh_distribution, model_display_names, model_metrics, model_selector_names, performance_gradient, selectable_models, serving_models, soh_percent, survival_family_validation_rows, survival_model_metrics
 
 
 @st.cache_resource
@@ -49,15 +49,18 @@ def persist_current_model(dataset):
     with database().cursor() as cursor:
         cursor.execute(
             """
-            INSERT INTO analytics.current_models (dataset, model_version, selection_revision, updated_at)
-            SELECT %(dataset)s, model_version, 1, NOW()
+            INSERT INTO analytics.current_models (dataset, model_version, model_fingerprint, selection_revision, updated_at)
+            SELECT %(dataset)s, model_version, model_fingerprint, 1, NOW()
             FROM analytics.model_evaluations
             WHERE dataset = %(dataset)s AND model_version = %(model_version)s
               AND status IN ('candidate', 'champion')
             ON CONFLICT (dataset) DO UPDATE
             SET model_version = EXCLUDED.model_version,
+                model_fingerprint = EXCLUDED.model_fingerprint,
                 selection_revision = analytics.current_models.selection_revision + 1,
                 updated_at = NOW()
+            WHERE analytics.current_models.model_version IS DISTINCT FROM EXCLUDED.model_version
+               OR analytics.current_models.model_fingerprint IS DISTINCT FROM EXCLUDED.model_fingerprint
             """,
             {"dataset": dataset, "model_version": model_version},
         )
@@ -82,7 +85,7 @@ def current_model(models):
         return None
     persisted = serving_rows("SELECT model_version FROM analytics.current_models WHERE dataset = %(dataset)s", {"dataset": models[0]["dataset"]})
     persisted_version = persisted[0]["model_version"] if persisted else None
-    models = selectable_models(models, current_version=persisted_version)
+    models = serving_models(models)
     versions = [model["model_version"] for model in models]
     selected = persisted_version or st.session_state.get("current_model_version")
     if selected not in versions:
@@ -114,11 +117,14 @@ def persist_current_survival_model(dataset):
                 model_fingerprint = EXCLUDED.model_fingerprint,
                 selection_revision = analytics.current_survival_models.selection_revision + 1,
                 updated_at = NOW()
+            WHERE analytics.current_survival_models.model_version IS DISTINCT FROM EXCLUDED.model_version
+               OR analytics.current_survival_models.model_fingerprint IS DISTINCT FROM EXCLUDED.model_fingerprint
             """,
             {"dataset": dataset, "model_version": model_version},
         )
     database().commit()
     serving_rows.clear()
+    rows.clear()
 
 
 def current_survival_model(models):
@@ -126,7 +132,7 @@ def current_survival_model(models):
         return None
     persisted = serving_rows("SELECT model_version FROM analytics.current_survival_models WHERE dataset = %(dataset)s", {"dataset": models[0]["dataset"]})
     persisted_version = persisted[0]["model_version"] if persisted else None
-    models = selectable_models(models, current_version=persisted_version)
+    models = serving_models(models)
     versions = [model["model_version"] for model in models]
     selected = persisted_version or st.session_state.get("current_survival_model_version", versions[0])
     if selected not in versions:
@@ -163,10 +169,35 @@ def fleet_page():
     selected_model = current_model(models)
     selected_version = selected_model["model_version"] if selected_model else None
     selected_name = model_display_names(models).get(selected_version, "Unavailable")
+    survival_models = survival_evaluations()
+    selected_survival = current_survival_model(survival_models)
+    selected_survival_version = selected_survival["model_version"] if selected_survival else None
+    survival_values = pd.DataFrame(rows(
+        """
+        SELECT state.battery_id, prediction.survival_probability AS survival_probability_100_cycles
+        FROM analytics.dashboard_battery_latest AS state
+        JOIN analytics.current_survival_models AS current USING (dataset)
+        JOIN analytics.battery_current_survival_predictions AS prediction
+          ON prediction.dataset = state.dataset
+         AND prediction.battery_id = state.battery_id
+         AND prediction.cycle_index = state.current_cycle
+         AND prediction.model_version = current.model_version
+         AND prediction.model_fingerprint = current.model_fingerprint
+         AND prediction.selection_revision = current.selection_revision
+         AND prediction.horizon_cycles = 100
+        WHERE state.dataset = %(dataset)s
+        """,
+        {"dataset": fleet.iloc[0]["dataset"]},
+    ))
+    if survival_values.empty:
+        fleet["survival_probability_100_cycles"] = pd.NA
+    else:
+        fleet = fleet.merge(survival_values, on="battery_id", how="left")
 
     st.subheader("Current model")
-    active = selectable_models(models, current_version=selected_version)
+    active = serving_models(models)
     versions = [model["model_version"] for model in active]
+    selector_names = model_selector_names(active)
     if versions:
         st.selectbox(
             "Current model",
@@ -175,7 +206,7 @@ def fleet_page():
             key="current_model_version",
             on_change=persist_current_model,
             args=(fleet.iloc[0]["dataset"],),
-            format_func=lambda version: model_display_names(models).get(version, version),
+            format_func=lambda version: selector_names.get(version, version),
             label_visibility="collapsed",
         )
     selected_model = current_model(models)
@@ -183,13 +214,25 @@ def fleet_page():
     selected_name = model_display_names(models).get(selected_version, "Unavailable")
 
     rul_predictions_available = int(fleet["predicted_rul_cycles"].notna().sum())
+    descriptive_kpis = fleet_descriptive_kpis(fleet)
+
+    def cycles(value):
+        return "Unavailable" if value is None else f"{value:.0f} cycles"
+
+    def percentage(value):
+        return "Unavailable" if value is None else f"{value:.1f}%"
 
     metric_row = st.columns(4)
     metric_row[0].metric("Batteries tracked", len(fleet))
     metric_row[1].metric("Average SOH", f"{fleet['measured_soh'].mean():.1%}")
     metric_row[2].metric("Median SOH", f"{fleet['measured_soh'].median():.1%}")
     metric_row[3].metric("RUL predictions available", rul_predictions_available)
-    st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {selected_name}.")
+    serving_kpi_row = st.columns(4)
+    serving_kpi_row[0].metric("Median predicted RUL", cycles(descriptive_kpis["median_predicted_rul_cycles"]))
+    serving_kpi_row[1].metric("P25 predicted RUL", cycles(descriptive_kpis["p25_predicted_rul_cycles"]))
+    serving_kpi_row[2].metric("Median +100 survival", percentage(descriptive_kpis["median_survival_probability_100_pct"]))
+    serving_kpi_row[3].metric("P25 +100 survival", percentage(descriptive_kpis["p25_survival_probability_100_pct"]))
+    st.caption(f"Measured SOH is derived from capacity. RUL is predicted by {selected_name}; +100-cycle survival is from {model_display_names(survival_models).get(selected_survival_version, 'Unavailable')}.")
 
     st.subheader("Measured SOH distribution")
     histogram = measured_soh_distribution(fleet)
@@ -204,7 +247,7 @@ def fleet_page():
 
     st.subheader("Battery table")
     with st.expander("Filters", expanded=False):
-        filters = st.columns(3)
+        filters = st.columns(4)
         search = filters[0].text_input("Battery ID")
         measured_soh = fleet["measured_soh"].map(soh_percent)
         max_soh = filters[1].number_input(
@@ -223,20 +266,30 @@ def fleet_page():
             value=available_rul_max,
             step=1.0,
         )
+        max_survival = filters[3].number_input(
+            "Maximum +100-cycle survival probability (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=100.0,
+            step=1.0,
+        )
     filtered = filter_batteries_by_risk(
         fleet,
         search,
         max_soh=max_soh,
         max_rul=max_rul if selected_version else float("inf"),
+        max_survival=max_survival if selected_survival_version else 100.0,
     )
     filtered = filtered.assign(lifecycle_stage=[lifecycle_stage(row.current_cycle, row.predicted_rul_cycles) for row in filtered.itertuples()])
     filtered["measured_soh_percent"] = filtered["measured_soh"].map(soh_percent)
+    filtered["survival_probability_100_cycles_percent"] = filtered["survival_probability_100_cycles"].map(soh_percent)
     visible = filtered.rename(
         columns={
             "battery_id": "Battery",
             "current_cycle": "Current cycle",
             "measured_soh_percent": "Measured SOH (%)",
             "predicted_rul_cycles": "Predicted RUL (cycles)",
+            "survival_probability_100_cycles_percent": "Survive +100 cycles (%)",
             "estimated_eol_cycle": "Estimated EOL cycle",
             "lifecycle_stage": "Lifecycle stage",
             "prediction_created_at": "Prediction timestamp",
@@ -245,7 +298,7 @@ def fleet_page():
     visible["Predicted RUL (cycles)"] = visible["Predicted RUL (cycles)"].round()
     visible["Estimated EOL cycle"] = visible["Estimated EOL cycle"].round()
     event = st.dataframe(
-        visible[["Battery", "Current cycle", "Measured SOH (%)", "Predicted RUL (cycles)", "Estimated EOL cycle", "Lifecycle stage", "Prediction timestamp"]],
+        visible[["Battery", "Current cycle", "Measured SOH (%)", "Predicted RUL (cycles)", "Survive +100 cycles (%)", "Estimated EOL cycle", "Lifecycle stage", "Prediction timestamp"]],
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -253,6 +306,7 @@ def fleet_page():
         column_config={
             "Measured SOH (%)": st.column_config.NumberColumn(format="%.1f"),
             "Predicted RUL (cycles)": st.column_config.NumberColumn(format="%.0f"),
+            "Survive +100 cycles (%)": st.column_config.NumberColumn(format="%.1f"),
             "Estimated EOL cycle": st.column_config.NumberColumn(format="%.0f"),
         },
     )
@@ -287,9 +341,13 @@ def battery_page():
     st.caption("Measured SOH/capacity is independent of the selected model.")
 
     survival_models = survival_evaluations()
+    survival_names = model_display_names(survival_models)
     selected_survival = current_survival_model(survival_models)
+    st.subheader("Survival outlook")
     serving = current_survival_serving_state(latest.dataset)
-    if not serving:
+    if not selected_survival:
+        st.info("No persisted Current Survival model is available.")
+    elif not serving:
         st.info("Finalized stream state is unavailable.")
     elif serving[0]["status"] != "served":
         status = serving[0]["status"] or "pending"
@@ -297,23 +355,32 @@ def battery_page():
         st.info(f"Survival serving is {status}." + (f" {detail}" if detail else ""))
     elif selected_survival:
         curve = pd.DataFrame(rows(
-            """SELECT horizon_cycles, survival_probability FROM analytics.battery_current_survival_predictions
+            """SELECT cycle_index, horizon_cycles, survival_probability FROM analytics.battery_current_survival_predictions
                WHERE model_version = %(model_version)s AND dataset = %(dataset)s AND battery_id = %(battery_id)s
                  AND state_id = %(state_id)s AND model_fingerprint = %(model_fingerprint)s
-                 AND selection_revision = %(selection_revision)s ORDER BY cycle_index DESC, horizon_cycles""",
+                 AND selection_revision = %(selection_revision)s AND cycle_index = %(cycle_index)s
+               ORDER BY horizon_cycles""",
             {"model_version": selected_survival["model_version"], "dataset": latest.dataset, "battery_id": battery_id,
              "state_id": serving[0]["state_id"], "model_fingerprint": serving[0]["model_fingerprint"],
-             "selection_revision": serving[0]["selection_revision"]},
+             "selection_revision": serving[0]["selection_revision"], "cycle_index": int(latest.current_cycle)},
         ))
+        curve = current_survival_curve(curve, int(latest.current_cycle))
         if not curve.empty:
-            latest_curve = curve[curve["horizon_cycles"].notna()].drop_duplicates("horizon_cycles", keep="first").sort_values("horizon_cycles")
-            st.subheader("Survival analysis")
-            st.caption(f"{family_label(selected_survival['model_name'])}: conditional probability of remaining above the EOL threshold, given features at the current cycle.")
-            st.line_chart(latest_curve.set_index("horizon_cycles")[["survival_probability"]])
-            horizons = latest_curve.set_index("horizon_cycles")["survival_probability"]
+            st.caption(f"Current Survival model: {survival_names.get(selected_survival['model_version'], selected_survival['model_version'])}. Conditional survival probability is the chance of remaining above the EOL threshold for each horizon, given the current-cycle features.")
+            st.altair_chart(
+                alt.Chart(curve).mark_line(point=True).encode(
+                    x=alt.X("horizon_cycles:Q", title="Horizon (cycles)"),
+                    y=alt.Y("survival_probability:Q", title="Conditional survival probability", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
+                    tooltip=[alt.Tooltip("horizon_cycles:Q", title="Horizon (cycles)"), alt.Tooltip("survival_probability:Q", title="Conditional survival probability", format=".1%")],
+                ),
+                width="stretch",
+            )
+            horizons = curve.set_index("horizon_cycles")["survival_probability"]
             cards = st.columns(3)
             for card, horizon in zip(cards, (50, 100, 200)):
                 card.metric(f"Survive +{horizon} cycles", "Unavailable" if horizon not in horizons else f"{horizons[horizon]:.1%}")
+        else:
+            st.info("No current-cycle Survival prediction is available for this battery.")
 
     health = pd.DataFrame(rows(
         """
@@ -389,19 +456,22 @@ def model_page():
         st.info("No non-retired canonical model generations are available for monitoring.")
         return
     versions = [model["model_version"] for model in active]
+    selector_models = serving_models(models)
+    selector_versions = [model["model_version"] for model in selector_models]
+    selector_names = model_selector_names(selector_models)
     st.subheader("Current model")
     if selected_model:
         st.selectbox(
             "Current model",
-            versions,
-            index=versions.index(selected_model["model_version"]) if selected_model and selected_model["model_version"] in versions else 0,
+            selector_versions,
+            index=selector_versions.index(selected_model["model_version"]),
             key="current_model_version",
             on_change=persist_current_model,
             args=(selected_model["dataset"],),
-            format_func=lambda version: model_names.get(version, version),
+            format_func=lambda version: selector_names.get(version, version),
             label_visibility="collapsed",
         )
-    st.caption("Current is the serving model. Model selection uses validation metrics only; test metrics are held-out evaluation.")
+    st.caption("Current is the serving model.")
     flattened = pd.DataFrame([model_metrics(model) for model in active])
     flattened.insert(0, "Display model", [model_names.get(model["model_version"], model["model_version"]) for model in active])
     flattened = flattened.drop(columns=["Model version", "Model fingerprint"], errors="ignore")
@@ -409,8 +479,9 @@ def model_page():
     st.subheader("Model performance comparison")
     st.dataframe(
         performance_gradient(
-            flattened[["Display model", "Selection", "Generation", "Selected model family", "Validation MAE", "Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"]],
+            flattened[["Display model", "Selection", "Generation", "Selected model family", "Validation MAE", "Test MAE", "Test RMSE", "Test R²", "Early MAE", "Mid MAE", "Late MAE"]],
             lower_is_better=["Validation MAE", "Test MAE", "Test RMSE", "Early MAE", "Mid MAE", "Late MAE"],
+            higher_is_better=["Test R²"],
         ),
         hide_index=True,
         width="stretch",
@@ -418,6 +489,7 @@ def model_page():
             "Validation MAE": st.column_config.NumberColumn(format="%.1f"),
             "Test MAE": st.column_config.NumberColumn(format="%.1f"),
             "Test RMSE": st.column_config.NumberColumn(format="%.1f"),
+            "Test R²": st.column_config.NumberColumn(format="%.3f"),
             "Early MAE": st.column_config.NumberColumn(format="%.1f"),
             "Mid MAE": st.column_config.NumberColumn(format="%.1f"),
             "Late MAE": st.column_config.NumberColumn(format="%.1f"),
@@ -439,7 +511,7 @@ def model_page():
         ),
         width="stretch",
     )
-    st.caption("MAE: average absolute error in cycles (↓ better) · RMSE: penalizes larger errors more heavily (↓ better) · Lifecycle MAE: error by early/mid/late battery life (↓ better).")
+    st.caption("Model selection uses validation metrics only; test metrics are held-out evaluation.")
 
     st.subheader("Validation comparison")
     generation_version = st.selectbox(
@@ -454,16 +526,14 @@ def model_page():
     else:
         st.dataframe(
             performance_gradient(
-                family_validation,
+                family_validation[["Model family", "Configuration", "Validation MAE", "Validation RMSE", "Selected"]],
                 lower_is_better=["Validation MAE", "Validation RMSE"],
-                higher_is_better=["Validation R²"],
             ),
             hide_index=True,
             width="stretch",
             column_config={
                 "Validation MAE": st.column_config.NumberColumn(format="%.1f"),
                 "Validation RMSE": st.column_config.NumberColumn(format="%.1f"),
-                "Validation R²": st.column_config.NumberColumn(format="%.3f"),
             },
         )
         st.altair_chart(
@@ -471,22 +541,15 @@ def model_page():
                 x=alt.X("Model family:N", sort=["Ridge", "Random Forest", "XGBoost", "MLP"]),
                 y="Validation MAE:Q",
                 color=alt.Color("Selected:N", scale=alt.Scale(domain=[False, True], range=["#9aa0a6", "#1f77b4"])),
-                tooltip=["Model family", "Configuration", "Validation MAE", "Validation RMSE", "Validation R²", "Selected"],
+                tooltip=["Model family", "Configuration", "Validation MAE", "Validation RMSE", "Selected"],
             ),
             width="stretch",
         )
 
-    st.subheader("R² comparison")
-    st.dataframe(
-        performance_gradient(
-            flattened[["Display model", "Selection", "Test R²"]].rename(columns={"Test R²": "R²"}),
-            higher_is_better=["R²"],
-        ),
-        hide_index=True,
-        width="stretch",
-        column_config={"R²": st.column_config.NumberColumn(format="%.3f")},
-    )
-    st.caption("R²: explained variation (↑ better).")
+    st.caption("MAE: on average, how many cycles the prediction is off by (↓ better)")
+    st.caption("RMSE: prediction error that penalizes large misses more heavily (↓ better)")
+    st.caption("R²: how much of the variation in actual RUL the model explains (↑ better)")
+    st.caption("Lifecycle MAE: prediction error during early, mid, and late battery life (↓ better)")
 
 
 def survival_model_page():
@@ -499,10 +562,13 @@ def survival_model_page():
         return
     model_names = model_display_names(models)
     versions = [model["model_version"] for model in models]
+    selector_models = serving_models(all_models)
+    selector_versions = [model["model_version"] for model in selector_models]
+    selector_names = model_selector_names(selector_models)
     selected_version = selected["model_version"]
     st.subheader("Current model")
-    selected_version = st.selectbox("Current survival model", versions, index=versions.index(selected_version), key="current_survival_model_version", on_change=persist_current_survival_model, args=(models[0]["dataset"],), format_func=lambda version: model_names.get(version, version), label_visibility="collapsed")
-    selected = next(model for model in models if model["model_version"] == selected_version)
+    selected_version = st.selectbox("Current survival model", selector_versions, index=selector_versions.index(selected_version), key="current_survival_model_version", on_change=persist_current_survival_model, args=(models[0]["dataset"],), format_func=lambda version: selector_names.get(version, version), label_visibility="collapsed")
+    selected = next(model for model in selector_models if model["model_version"] == selected_version)
     st.caption("Current survival model governs survival curves only; RUL uses the separate Current model. Validation selects candidate models; test metrics are held-out evaluation only.")
     flattened = pd.DataFrame([survival_model_metrics(model) for model in models])
     flattened.insert(0, "Display model", [model_names[model["model_version"]] for model in models])
@@ -518,13 +584,15 @@ def survival_model_page():
         hide_index=True,
         width="stretch",
         column_config={
-            "Validation IBS": st.column_config.NumberColumn(format="%.3f"),
-            "Validation IPCW C-index": st.column_config.NumberColumn(format="%.3f"),
-            "Test IBS": st.column_config.NumberColumn(format="%.3f"),
-            "Test IPCW C-index": st.column_config.NumberColumn(format="%.3f"),
+            "Validation IBS": st.column_config.NumberColumn(format="%.5f"),
+            "Validation IPCW C-index": st.column_config.NumberColumn(format="%.5f"),
+            "Test IBS": st.column_config.NumberColumn(format="%.5f"),
+            "Test IPCW C-index": st.column_config.NumberColumn(format="%.5f"),
         },
     )
-    st.caption("IBS: integrated probability error (↓ better) · IPCW C-index: censoring-adjusted risk ranking (↑ better). Model selection uses validation metrics only; test metrics are held-out evaluation.")
+    st.caption("Model selection uses validation metrics only; test metrics are held-out evaluation.")
+    st.caption("IBS: how far predicted survival probabilities are from actual outcomes over time (↓ better)")
+    st.caption("IPCW C-index: how well the model ranks which batteries are likely to fail sooner (↑ better)")
     st.subheader("Validation comparison")
     generation_version = st.selectbox(
         "Generation",
@@ -544,8 +612,8 @@ def survival_model_page():
             hide_index=True,
             width="stretch",
             column_config={
-                "Validation IBS": st.column_config.NumberColumn(format="%.3f"),
-                "Validation IPCW C-index": st.column_config.NumberColumn(format="%.3f"),
+                "Validation IBS": st.column_config.NumberColumn(format="%.5f"),
+                "Validation IPCW C-index": st.column_config.NumberColumn(format="%.5f"),
             },
         )
 

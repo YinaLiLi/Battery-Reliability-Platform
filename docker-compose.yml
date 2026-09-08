@@ -26,7 +26,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       DASHBOARD_POSTGRES_PASSWORD: ${DASHBOARD_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}}
-    command: ["sh", "-c", "psql -v ON_ERROR_STOP=1 -v dashboard_password=\"$$DASHBOARD_POSTGRES_PASSWORD\" -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/001_analytics.sql -f /sql/002_drop_legacy_ev.sql -f /sql/003_dashboard_role.sql"]
+    command: ["sh", "-c", "psql -v ON_ERROR_STOP=1 -v dashboard_password=\"$$DASHBOARD_POSTGRES_PASSWORD\" -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/001_analytics.sql -f /sql/003_dashboard_role.sql"]
     volumes:
       - ./sql:/sql:ro
 
@@ -115,8 +115,8 @@ services:
       - ./:/opt/project
     command: >-
       /opt/spark/bin/spark-submit
-      --master spark://spark-master:7077
-      /opt/project/src/spark_pipeline.py
+      --master local[1]
+      /opt/project/scripts/spark_smoke.py
     depends_on:
       - spark-master
       - spark-worker-1
@@ -130,6 +130,7 @@ services:
       - ./:/opt/project
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPARK_MAX_OFFSETS_PER_TRIGGER: ${SPARK_MAX_OFFSETS_PER_TRIGGER:-5000000}
       POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-battery_reliability}
       POSTGRES_USER: ${POSTGRES_USER:-battery_reliability}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
@@ -183,6 +184,7 @@ services:
     volumes:
       - ./:/opt/project
     environment:
+      POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-battery_reliability}
       POSTGRES_DB: ${POSTGRES_DB:-battery_reliability}
       POSTGRES_USER: ${POSTGRES_USER:-battery_reliability}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
@@ -215,6 +217,7 @@ services:
       AIRFLOW_HOME: /opt/airflow
       AIRFLOW__CORE__DAGS_FOLDER: /opt/project/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-battery_reliability}

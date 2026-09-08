@@ -1,4 +1,5 @@
 """Small presentation helpers for the read-only reliability dashboard."""
+from collections import Counter
 import json
 import math
 
@@ -54,7 +55,7 @@ def soh_percent(soh):
     return round(soh * 100, 2)
 
 
-def filter_batteries_by_risk(fleet, battery_id, *, max_soh, max_rul):
+def filter_batteries_by_risk(fleet, battery_id, *, max_soh, max_rul, max_survival=100.0):
     """Apply optional maximum-risk thresholds without hiding missing values by default."""
     filtered = fleet[fleet["battery_id"].str.contains(battery_id, case=False, na=False)]
     soh = pd.to_numeric(filtered["measured_soh"], errors="coerce") * 100
@@ -63,7 +64,31 @@ def filter_batteries_by_risk(fleet, battery_id, *, max_soh, max_rul):
     rul = pd.to_numeric(filtered["predicted_rul_cycles"], errors="coerce")
     if not rul.dropna().empty and max_rul < rul.max():
         filtered = filtered[rul.notna() & (rul <= max_rul)]
+    if "survival_probability_100_cycles" not in filtered:
+        return filtered
+    survival = pd.to_numeric(filtered["survival_probability_100_cycles"], errors="coerce")
+    if not survival.dropna().empty and max_survival < survival.max() * 100:
+        filtered = filtered[survival.notna() & ((survival * 100) <= max_survival)]
     return filtered
+
+
+def fleet_descriptive_kpis(fleet):
+    """Summarize non-null latest serving predictions for the monitoring KPI strip."""
+    rul = pd.to_numeric(fleet["predicted_rul_cycles"], errors="coerce").dropna()
+    survival = pd.to_numeric(fleet["survival_probability_100_cycles"], errors="coerce").dropna() * 100
+    return {
+        "median_predicted_rul_cycles": None if rul.empty else float(rul.median()),
+        "p25_predicted_rul_cycles": None if rul.empty else float(rul.quantile(0.25)),
+        "median_survival_probability_100_pct": None if survival.empty else float(survival.median()),
+        "p25_survival_probability_100_pct": None if survival.empty else float(survival.quantile(0.25)),
+    }
+
+
+def current_survival_curve(predictions, current_cycle):
+    """Return persisted survival probabilities only for the finalized current cycle."""
+    if predictions.empty or not {"cycle_index", "horizon_cycles"}.issubset(predictions):
+        return predictions.iloc[0:0].copy()
+    return predictions.loc[predictions["cycle_index"].eq(current_cycle)].sort_values("horizon_cycles").reset_index(drop=True)
 
 
 def measured_soh_distribution(fleet, bin_width=5):
@@ -203,6 +228,25 @@ def model_display_names(models):
     return {
         model["model_version"]: f"Model {model.get('generation') or (model.get('training_metadata') or {}).get('generation')} — {family_label(_normalized_model_family(model))}"
         for model in active
+    }
+
+
+def serving_models(models):
+    """Return every selectable exact artifact without collapsing generations."""
+    active = [model for model in models if model.get("status") in {"candidate", "champion"} and model.get("model_fingerprint")]
+    names = model_display_names(active)
+    return sorted(active, key=lambda model: (names[model["model_version"]], str(model.get("evaluated_at", "")), model["model_version"]))
+
+
+def model_selector_names(models):
+    """Disambiguate duplicate display labels with a short artifact fingerprint."""
+    names = model_display_names(models)
+    counts = Counter(names.values())
+    return {
+        model["model_version"]: names[model["model_version"]]
+        if counts[names[model["model_version"]]] == 1
+        else f"{names[model['model_version']]} · artifact {model['model_fingerprint'][:8]}"
+        for model in models
     }
 
 

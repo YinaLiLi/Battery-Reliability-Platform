@@ -72,10 +72,21 @@ def build_current_survival_prediction_upsert_sql(staging_table):
     return f"""INSERT INTO {target} ({columns})
 SELECT {columns} FROM {staging_table}
 ON CONFLICT (dataset, battery_id, horizon_cycles) DO UPDATE SET {updates}
-WHERE EXCLUDED.replay_sequence > {target}.replay_sequence
-   OR (EXCLUDED.replay_sequence = {target}.replay_sequence
-       AND EXCLUDED.state_id = {target}.state_id
-       AND EXCLUDED.selection_revision > {target}.selection_revision)"""
+WHERE EXISTS (
+          SELECT 1
+          FROM analytics.current_stream_states AS state
+          JOIN analytics.current_survival_models AS current USING (dataset)
+          WHERE state.dataset = EXCLUDED.dataset AND state.state_id = EXCLUDED.state_id
+            AND current.model_version = EXCLUDED.model_version
+            AND current.model_fingerprint = EXCLUDED.model_fingerprint
+            AND current.selection_revision = EXCLUDED.selection_revision
+      )
+  AND (EXCLUDED.cycle_index > {target}.cycle_index
+       OR (EXCLUDED.cycle_index = {target}.cycle_index
+           AND (EXCLUDED.replay_sequence > {target}.replay_sequence
+                OR (EXCLUDED.replay_sequence = {target}.replay_sequence
+                    AND (EXCLUDED.selection_revision > {target}.selection_revision
+                         OR EXCLUDED.state_id IS DISTINCT FROM {target}.state_id)))))"""
 
 def build_current_stream_state_upsert_sql(staging_table):
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", staging_table):
@@ -95,6 +106,31 @@ ON CONFLICT (dataset, state_id, consumer, selection_revision) DO UPDATE SET
     model_version = EXCLUDED.model_version, model_fingerprint = EXCLUDED.model_fingerprint,
     status = EXCLUDED.status, rows_written = EXCLUDED.rows_written,
     error_message = EXCLUDED.error_message, updated_at = EXCLUDED.updated_at"""
+
+def build_current_model_initialization_sql():
+    """Initialize both Current selections once from stable evaluation ordering."""
+    return """DO $current_models$
+BEGIN
+IF NOT EXISTS (SELECT 1 FROM analytics.model_evaluations WHERE status IN ('candidate', 'champion') AND model_fingerprint IS NOT NULL)
+   OR NOT EXISTS (SELECT 1 FROM analytics.survival_model_evaluations WHERE status IN ('candidate', 'champion') AND model_fingerprint IS NOT NULL) THEN
+    RAISE EXCEPTION 'Both RUL and Survival evaluations must exist before Current initialization';
+END IF;
+INSERT INTO analytics.current_models (dataset, model_version, model_fingerprint, selection_revision)
+SELECT dataset, model_version, model_fingerprint, 1
+FROM analytics.model_evaluations
+WHERE status IN ('candidate', 'champion') AND model_fingerprint IS NOT NULL
+ORDER BY evaluated_at DESC, model_version DESC
+LIMIT 1
+ON CONFLICT (dataset) DO NOTHING;
+INSERT INTO analytics.current_survival_models (dataset, model_version, model_fingerprint, selection_revision)
+SELECT dataset, model_version, model_fingerprint, 1
+FROM analytics.survival_model_evaluations
+WHERE status IN ('candidate', 'champion') AND model_fingerprint IS NOT NULL
+ORDER BY evaluated_at DESC, model_version DESC
+LIMIT 1
+ON CONFLICT (dataset) DO NOTHING;
+END
+$current_models$"""
 
 def validate_snapshot(frame, dataset):
     keys = DATASETS[dataset]["keys"]
@@ -154,12 +190,20 @@ def load_snapshot(spark, dataset, jdbc_url, user, password, source_path=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Load MATR serving snapshots into PostgreSQL.")
-    parser.add_argument("--dataset", choices=DATASETS, required=True); parser.add_argument("--master", default=DEFAULT_MASTER); parser.add_argument("--jdbc-url", default=os.environ.get("POSTGRES_JDBC_URL", DEFAULT_JDBC_URL)); parser.add_argument("--jdbc-user", default=os.environ.get("POSTGRES_USER", "battery_reliability")); parser.add_argument("--jdbc-password", default=os.environ.get("POSTGRES_PASSWORD"), required=os.environ.get("POSTGRES_PASSWORD") is None); parser.add_argument("--source-path", type=Path)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--dataset", choices=DATASETS)
+    action.add_argument("--initialize-current", action="store_true")
+    parser.add_argument("--master", default=DEFAULT_MASTER); parser.add_argument("--jdbc-url", default=os.environ.get("POSTGRES_JDBC_URL", DEFAULT_JDBC_URL)); parser.add_argument("--jdbc-user", default=os.environ.get("POSTGRES_USER", "battery_reliability")); parser.add_argument("--jdbc-password", default=os.environ.get("POSTGRES_PASSWORD"), required=os.environ.get("POSTGRES_PASSWORD") is None); parser.add_argument("--source-path", type=Path)
     return parser.parse_args()
 
 def main():
     args = parse_args(); spark = build_spark_session(args.master); spark.sparkContext.setLogLevel("WARN")
-    try: print(f"Loaded {load_snapshot(spark, args.dataset, args.jdbc_url, args.jdbc_user, args.jdbc_password, args.source_path)} {args.dataset} row(s).")
+    try:
+        if args.initialize_current:
+            _execute(spark, args.jdbc_url, args.jdbc_user, args.jdbc_password, build_current_model_initialization_sql())
+            print("Initialized deterministic Current RUL and Survival selections.")
+        else:
+            print(f"Loaded {load_snapshot(spark, args.dataset, args.jdbc_url, args.jdbc_user, args.jdbc_password, args.source_path)} {args.dataset} row(s).")
     finally: spark.stop()
 
 if __name__ == "__main__": main()

@@ -61,7 +61,26 @@ def scan(root):
     }
 
 
+def qc_errors(report):
+    expected = {
+        "battery_dim_rows": 169,
+        "unique_battery_ids": 169,
+        "cycle_summary_rows": 140001,
+        "measurement_rows": 130573638,
+        "cycle_key_duplicates": 0,
+        "measurement_ordering_errors": 0,
+        "invalid_soh": 0,
+        "negative_rul": 0,
+    }
+    errors = [f"{name} must equal {value}" for name, value in expected.items() if report.get(name) != value]
+    if report.get("monotonic_cycles") is not True:
+        errors.append("monotonic_cycles must be true")
+    return errors
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(); parser.add_argument("--root", default="data/processed/matr"); parser.add_argument("--output")
     args = parser.parse_args(); report = scan(args.root); print(json.dumps(report, indent=2, sort_keys=True))
     if args.output: Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True))
+    errors = qc_errors(report)
+    if errors: raise SystemExit("MATR QC failed: " + "; ".join(errors))

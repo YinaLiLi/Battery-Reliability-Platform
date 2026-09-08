@@ -7,16 +7,16 @@ from pathlib import Path
 
 try:
     from .feature_contract import RUL_FEATURES
-    from .shared_features import load_current_feature_rows
+    from .shared_features import load_current_monitoring_feature_rows
     from .serving_status import current_stream_state_row, serving_status_row, upsert_current_stream_state, upsert_serving_status
     from .stream_state import validate_finalized_cycle_boundary, validate_stream_state_manifest
-    from .survival_stream_inference import current_survival_rows
+    from .survival_stream_inference import HORIZON_GRID, current_survival_rows
 except ImportError:
     from feature_contract import RUL_FEATURES
-    from shared_features import load_current_feature_rows
+    from shared_features import load_current_monitoring_feature_rows
     from serving_status import current_stream_state_row, serving_status_row, upsert_current_stream_state, upsert_serving_status
     from stream_state import validate_finalized_cycle_boundary, validate_stream_state_manifest
-    from survival_stream_inference import current_survival_rows
+    from survival_stream_inference import HORIZON_GRID, current_survival_rows
 
 
 def newest_finalized_features(features, boundary, benchmark_battery_ids=()):
@@ -32,13 +32,23 @@ def newest_finalized_features(features, boundary, benchmark_battery_ids=()):
     return [latest[battery] for battery in sorted(latest)]
 
 
-def should_process(status):
-    return not status or status.get("status") != "served"
+def should_process(status, *, expected_rows, complete):
+    return not complete or not status or status.get("status") != "served" or status.get("rows_written") != expected_rows
+
+
+def coverage_complete(features, coverage):
+    expected = {row["battery_id"]: int(row["cycle_index"]) for row in features}
+    actual = {
+        row["battery_id"]: (int(row["cycle_index"]), tuple(int(value) for value in row["horizons"]))
+        for row in coverage
+    }
+    horizons = tuple(HORIZON_GRID)
+    return len(actual) == len(coverage) == len(expected) and all(actual.get(battery) == (cycle, horizons) for battery, cycle in expected.items())
 
 
 def _selection(cursor):
     cursor.execute("""
-        SELECT current.model_version, current.model_fingerprint AS selected_fingerprint,
+        SELECT current.dataset, current.model_version, current.model_fingerprint AS selected_fingerprint,
                current.selection_revision, evaluation.model_fingerprint, evaluation.training_metadata
         FROM analytics.current_survival_models AS current
         JOIN analytics.survival_model_evaluations AS evaluation USING (model_version)
@@ -49,12 +59,23 @@ def _selection(cursor):
 
 def _status(cursor, state_id, selection):
     cursor.execute("""
-        SELECT status FROM analytics.stream_serving_status
+        SELECT status, rows_written FROM analytics.stream_serving_status
         WHERE dataset = 'MATR' AND state_id = %s AND consumer = 'survival_current'
-          AND selection_revision = %s
-    """, (state_id, selection["selection_revision"]))
+          AND selection_revision = %s AND model_version = %s AND model_fingerprint = %s
+    """, (state_id, selection["selection_revision"], selection["model_version"], selection["model_fingerprint"]))
     row = cursor.fetchone()
     return dict(row) if row else None
+
+
+def _coverage(cursor, state_id, selection):
+    cursor.execute("""
+        SELECT battery_id, cycle_index, ARRAY_AGG(horizon_cycles ORDER BY horizon_cycles) AS horizons
+        FROM analytics.battery_current_survival_predictions
+        WHERE dataset = %s AND state_id = %s AND model_version = %s
+          AND model_fingerprint = %s AND selection_revision = %s
+        GROUP BY battery_id, cycle_index
+    """, (selection["dataset"], state_id, selection["model_version"], selection["model_fingerprint"], selection["selection_revision"]))
+    return [dict(row) for row in cursor.fetchall()]
 
 
 def _merge_predictions(cursor, rows):
@@ -68,11 +89,36 @@ def _merge_predictions(cursor, rows):
             state_id = EXCLUDED.state_id, replay_sequence = EXCLUDED.replay_sequence,
             feature_contract_version = EXCLUDED.feature_contract_version,
             selection_revision = EXCLUDED.selection_revision, inference_created_at = EXCLUDED.inference_created_at
-        WHERE EXCLUDED.replay_sequence > analytics.battery_current_survival_predictions.replay_sequence
-           OR (EXCLUDED.replay_sequence = analytics.battery_current_survival_predictions.replay_sequence
-               AND EXCLUDED.state_id = analytics.battery_current_survival_predictions.state_id
-               AND EXCLUDED.selection_revision > analytics.battery_current_survival_predictions.selection_revision)
+        WHERE EXISTS (
+                  SELECT 1
+                  FROM analytics.current_stream_states AS state
+                  JOIN analytics.current_survival_models AS current USING (dataset)
+                  WHERE state.dataset = EXCLUDED.dataset AND state.state_id = EXCLUDED.state_id
+                    AND current.model_version = EXCLUDED.model_version
+                    AND current.model_fingerprint = EXCLUDED.model_fingerprint
+                    AND current.selection_revision = EXCLUDED.selection_revision
+              )
+          AND (EXCLUDED.cycle_index > analytics.battery_current_survival_predictions.cycle_index
+               OR (EXCLUDED.cycle_index = analytics.battery_current_survival_predictions.cycle_index
+                   AND (EXCLUDED.replay_sequence > analytics.battery_current_survival_predictions.replay_sequence
+                        OR (EXCLUDED.replay_sequence = analytics.battery_current_survival_predictions.replay_sequence
+                            AND (EXCLUDED.selection_revision > analytics.battery_current_survival_predictions.selection_revision
+                                 OR EXCLUDED.state_id IS DISTINCT FROM analytics.battery_current_survival_predictions.state_id)))))
     """, rows)
+
+
+def prune_stale_predictions(cursor, features):
+    """Keep only the newest finalized battery/cycle set for the current dataset."""
+    expected = sorted((row["battery_id"], int(row["cycle_index"])) for row in features)
+    cursor.execute("""
+        DELETE FROM analytics.battery_current_survival_predictions AS prediction
+        WHERE prediction.dataset = %s
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest(%s::text[], %s::integer[]) AS expected(battery_id, cycle_index)
+              WHERE expected.battery_id = prediction.battery_id
+                AND expected.cycle_index = prediction.cycle_index
+          )
+    """, (features[0]["dataset"], [row[0] for row in expected], [row[1] for row in expected]))
 
 
 def process_once(root, connection):
@@ -88,20 +134,21 @@ def process_once(root, connection):
             upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", None))
             connection.commit()
             return {"status": "unavailable", "rows": 0}
-        if not should_process(_status(cursor, manifest["state_id"], selection)):
-            connection.commit()
-            return {"status": "served", "rows": 0}
         try:
             if selection["selected_fingerprint"] != selection["model_fingerprint"]:
                 raise RuntimeError("current Survival model fingerprint mismatch")
             metadata = selection["training_metadata"] if isinstance(selection["training_metadata"], dict) else json.loads(selection["training_metadata"])
             if metadata.get("feature_version", "").rsplit(":", 1)[-1] != manifest["feature_contract_version"].rsplit(":", 1)[-1]:
                 raise RuntimeError("current Survival model feature contract mismatch")
+            features = load_current_monitoring_feature_rows(root, manifest)
+            expected_rows = len(features) * len(HORIZON_GRID)
+            complete = coverage_complete(features, _coverage(cursor, manifest["state_id"], selection))
+            if not should_process(_status(cursor, manifest["state_id"], selection), expected_rows=expected_rows, complete=complete):
+                connection.commit()
+                return {"status": "served", "rows": 0}
             upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection))
-            benchmark = json.loads((root / "fixed_offline_benchmark/v1/benchmark.json").read_text())
-            excluded = set(benchmark["splits"]["validation"]["battery_ids"]) | set(benchmark["splits"]["test"]["battery_ids"])
-            features = load_current_feature_rows(root, manifest, excluded_battery_ids=excluded)
             if not features:
+                cursor.execute("DELETE FROM analytics.battery_current_survival_predictions WHERE dataset = %s", (selection["dataset"],))
                 upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection, status="served"))
                 connection.commit()
                 return {"status": "served", "rows": 0}
@@ -112,9 +159,12 @@ def process_once(root, connection):
                 state_id=manifest["state_id"], feature_contract_version=manifest["feature_contract_version"],
                 selection_revision=selection["selection_revision"])
             _merge_predictions(cursor, rows)
-            upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection, status="served", rows_written=len(rows)))
+            prune_stale_predictions(cursor, features)
+            if not coverage_complete(features, _coverage(cursor, manifest["state_id"], selection)):
+                raise RuntimeError("current Survival publication is incomplete")
+            upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection, status="served", rows_written=expected_rows))
             connection.commit()
-            return {"status": "served", "rows": len(rows)}
+            return {"status": "served", "rows": expected_rows}
         except Exception as error:
             upsert_serving_status(cursor, serving_status_row("MATR", manifest["state_id"], "survival_current", selection,
                 status="failed", error_message=str(error)[:500]))
@@ -122,18 +172,30 @@ def process_once(root, connection):
             return {"status": "failed", "rows": 0}
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path("data/processed/matr"))
     parser.add_argument("--poll-seconds", type=int, default=30)
-    args = parser.parse_args()
+    parser.add_argument("--once", action="store_true", help="Refresh the current finalized state once, then exit.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     import psycopg
     while True:
         try:
             with psycopg.connect(os.environ["DATABASE_URL"], row_factory=psycopg.rows.dict_row) as connection:
-                print(process_once(args.root, connection), flush=True)
+                result = process_once(args.root, connection)
+                print(result, flush=True)
+                if args.once and result["status"] != "served":
+                    raise SystemExit(result["status"])
         except Exception as error:
             print(f"survival serving failed: {error}", flush=True)
+            if args.once:
+                raise
+        if args.once:
+            return
         time.sleep(args.poll_seconds)
 
 

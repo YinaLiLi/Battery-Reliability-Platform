@@ -25,8 +25,6 @@ Clone your fork and enter its root. On Linux, macOS, or WSL2:
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python scripts/preflight.py --profile unit
-python -m pytest --tier unit -q
 cp .env.example .env
 ```
 
@@ -36,7 +34,6 @@ Native Windows unit tests, in PowerShell:
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 .venv\Scripts\python scripts/preflight.py --profile unit
-.venv\Scripts\python -m pytest --tier unit -q
 ```
 
 Any Python 3.10–3.13 may replace 3.12. No subsystem needs a different host Python.
@@ -57,7 +54,7 @@ python scripts/preflight.py --profile compose
 docker compose config --quiet
 docker compose build spark-master
 docker compose --profile training build airflow dashboard survival-serving survival-training
-docker compose up -d
+docker compose up -d postgres kafka spark-master spark-worker-1 spark-worker-2 airflow
 ```
 
 Preflight's amd64 check runs a disposable Python container and may pull its image.
@@ -74,53 +71,91 @@ credentials are reported by Airflow; consult `docker compose logs airflow` local
 
 ## Data bootstrap
 
-Obtain the official BatteryLife MATR processed archive and life labels using the
-download instructions in [BatteryLife](https://github.com/Ruifeng-Tan/BatteryLife).
-Place them at `data/raw/batterylife/MATR.zip` and
-`data/raw/batterylife/Life labels/MATR_labels.json`. They are not distributed by this
-repository. Only use trusted publisher files: normalization loads Python pickle.
-No sample results or ignored artifacts are prerequisites for the commands below.
+Use the pinned official BatteryLife processed-data release at Zenodo record
+`19688272`. Download exactly these two files; they are not distributed here:
+
+| File | Bytes | MD5 |
+|---|---:|---|
+| `MATR.zip` | 4,864,920,138 | `83a1528858b9e1b7b6886757bb561669` |
+| `Life labels.zip` | 12,586 | `cd0cc01a7211972be45e8e38d86cdeca` |
+
+```sh
+mkdir -p data/raw/batterylife
+curl -fL 'https://zenodo.org/api/records/19688272/files/MATR.zip/content' -o data/raw/batterylife/MATR.zip
+curl -fL 'https://zenodo.org/api/records/19688272/files/Life%20labels.zip/content' -o 'data/raw/batterylife/Life labels.zip'
+md5sum data/raw/batterylife/MATR.zip 'data/raw/batterylife/Life labels.zip'
+python -c "from pathlib import Path; from src.normalize_matr import extract_archive; extract_archive(Path('data/raw/batterylife/Life labels.zip'))"
+test -f 'data/raw/batterylife/Life labels/MATR_labels.json'
+```
+
+On macOS, replace `md5sum FILE` with `md5 -q FILE`. Verify both hashes before
+normalization: the archive contains trusted publisher pickle data. Budget at least
+100 GiB of free disk and 16 GiB RAM for the complete 130-million-measurement run.
+The default Spark cluster uses two 1-core, 1 GiB workers; runtime varies
+substantially with CPU, storage, and Docker memory limits.
+
+Normalize and validate before starting event replay:
 
 ```sh
 python src/normalize_matr.py
-docker compose run --rm spark-submit
-python src/build_offline_benchmark.py
-python scripts/preflight.py --profile compose --data
-python src/kafka_producer.py --limit 100
-docker compose run --rm spark-stream-submit
+python src/matr_qc.py
+python scripts/preflight.py --profile full
+docker compose config --quiet
+docker compose build spark-master
+docker compose --profile training build airflow dashboard survival-serving survival-training
+docker compose up -d postgres kafka spark-master spark-worker-1 spark-worker-2 airflow
+docker compose run --rm postgres-init
+docker compose run --rm topic-init
+docker compose run --rm --no-deps spark-submit
 ```
 
-The bounded replay verifies infrastructure, not the full published experiment. The
-normalizer creates the arrival manifest. Full replay (`python src/kafka_producer.py`)
-is expensive and publishes the corpus. For continuous training, trigger
-`matr_shared_generation_retraining` with `state_manifest` set to a Streaming-issued
-finalized manifest and `generation` set to the intended generation. The DAG validates
-Kafka lineage and the persistent shared feature outlet, finalizes one cumulative selection receipt,
-and then fans out the same rows to RUL and Survival. Streaming appends only newly
-prefix-complete cycles; no per-generation historical feature snapshot is created.
-`generation_snapshots.py` remains the
-explicit offline/backfill state-reconstruction entry point; direct trainer use from
-that path requires `--offline-backfill`. Missing data/benchmark is caught by `--data`
-before expensive jobs.
-Measure disk and memory on the target machine before the full 130M-row experiment;
-the bounded smoke is not a full-corpus resource certification.
+The canonical workflow has one producer of finalized state and shared features:
+Spark Streaming. Offline state reconstruction is not part of the public workflow.
+
+```sh
+python src/kafka_producer.py
+docker compose run --rm spark-stream-submit
+test -f data/processed/matr/stream_state/latest.json
+test -f data/processed/matr/shared_feature_outlet/_outlet.json
+python src/build_offline_benchmark.py
+python scripts/preflight.py --profile compose --data
+```
+
+Streaming available-now processing exits after the current Kafka offsets are
+finalized. `SPARK_MAX_OFFSETS_PER_TRIGGER` defaults to 5,000,000 for the full
+corpus; lower it only if a worker cannot process that batch size.
+
+Trigger the shared Airflow generation after substituting the path printed by the
+first command:
+
+```sh
+STATE_MANIFEST=$(python -c "import json; from pathlib import Path; p=Path('data/processed/matr/stream_state/latest.json'); m=json.loads(p.read_text()); print(Path('data/processed/matr') / 'stream_state' / m['state_id'] / 'manifest.json')")
+docker compose exec -T airflow airflow dags unpause matr_shared_generation_retraining
+docker compose exec -T airflow airflow dags trigger matr_shared_generation_retraining --conf "{\"state_manifest\":\"$STATE_MANIFEST\",\"generation\":\"1.3\"}"
+docker compose exec -T airflow airflow dags list-runs matr_shared_generation_retraining
+```
+
+Wait for the run to succeed and for both candidate evaluation tables to be loaded.
+Then initialize both Current selections once, and explicitly refresh serving without
+publishing any additional Kafka events:
+
+```sh
+docker compose run --rm spark-postgres-load /opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.postgresql:postgresql:42.7.7 /opt/project/src/postgres_loader.py --initialize-current
+docker compose run --rm spark-stream-submit /opt/spark/bin/spark-submit --master spark://spark-master:7077 --packages org.postgresql:postgresql:42.7.7 /opt/project/src/spark_streaming.py --refresh-current
+docker compose run --rm survival-serving python -m src.survival_serving_worker --once
+docker compose run --rm spark-postgres-load
+docker compose up -d survival-serving dashboard
+```
+
+The initializer uses stable `evaluated_at`, then `model_version`, ordering and does
+not replace an existing Current selection. The Dashboard remains available at
+http://localhost:8501 after PostgreSQL is populated.
 
 ## Verification and acceptance
 
-```sh
-python scripts/preflight.py --profile spark
-python -m pytest --tier spark -q
-python scripts/preflight.py --profile survival
-python -m pytest --tier survival -q
-docker compose run --rm --no-deps airflow python3 -m pytest --tier airflow -q
-python -m pytest --tier integration -q
-```
-
-CI runs fresh checkouts for Python 3.10–3.13 and reports all skipped tests as failures.
-`--tracked` checks source/build references against `git ls-files`; developers must
-include new canonical files in their reviewed commit before a fork can use them.
-The Survival roundtrip test proves a newly trained model reloads in the pinned
-runtime; it does not authorize changing versions for existing serialized models.
+Run `python scripts/preflight.py --profile full --tracked --data`. The tracked-file
+guard requires `git ls-files` to match `.public-files` exactly. Public CI checks this
+product surface, container builds, Spark smoke, and SQL/bootstrap behavior.
 
 Manual release gates: repeat these commands on current macOS Docker Desktop and
 Windows WSL2, including a directory containing spaces, and record OS, architecture,

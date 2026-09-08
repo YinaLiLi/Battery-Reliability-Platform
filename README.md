@@ -2,6 +2,8 @@
 
 An end-to-end battery reliability and predictive analytics platform that processes progressive telemetry into time-consistent battery health state, RUL and survival predictions, and operational monitoring. BatteryLife MATR laboratory data is replayed through Kafka to simulate progressive real-world battery telemetry and lifecycle arrival for reproducible development and evaluation; this repository does not receive live production telemetry.
 
+The MIT License covers this repository's project code. Externally sourced BatteryLife/MATR archives and labels are not covered by this license; obtain and use them under their original source/provider terms.
+
 ## Results at a Glance
 
 Evaluation uses the canonical BatteryLife MATR laboratory corpus (169 batteries, 140,001 cycles, and 130,573,638 measurements). The fixed benchmark is held out from training and generation-cutoff selection.
@@ -49,21 +51,25 @@ flowchart TD
         SELECT --> SURVTRAIN["Survival training and evaluation"]
         RULTRAIN --> RULCAND["RUL candidate models"]
         SURVTRAIN --> SURVCAND["Survival candidate models"]
+        RULCAND --> RULPROMO["Select and publish RUL model"]
+        SURVCAND --> SURVPROMO["Select and publish Survival model"]
         BENCH["Fixed validation and test benchmark"] -.-> RULTRAIN
         BENCH -.-> SURVTRAIN
     end
 
     subgraph SERVE["CURRENT SERVING"]
         OUTLET --> CURRENT["Newest finalized cumulative rows"]
-        CURRENT --> RULMODEL["Current RUL model"]
-        CURRENT --> SURVMODEL["Current Survival model"]
+        RULPROMO --> RULMODEL["Current RUL model"]
+        SURVPROMO --> SURVMODEL["Current Survival model"]
+        CURRENT --> RULMODEL
+        CURRENT --> SURVMODEL
         RULMODEL --> PG["PostgreSQL"]
         SURVMODEL --> PG
         PG --> DASH["Streamlit monitoring dashboard"]
     end
 
     classDef component fill:transparent,stroke:#9ca3af,color:#374151;
-    class MATR,CANON,REPLAY,KAFKA,SPARK,FINAL,OUTLET,AIRFLOW,SELECT,RULTRAIN,SURVTRAIN,RULCAND,SURVCAND,BENCH,CURRENT,RULMODEL,SURVMODEL,PG,DASH component;
+    class MATR,CANON,REPLAY,KAFKA,SPARK,FINAL,OUTLET,AIRFLOW,SELECT,RULTRAIN,SURVTRAIN,RULCAND,SURVCAND,RULPROMO,SURVPROMO,BENCH,CURRENT,RULMODEL,SURVMODEL,PG,DASH component;
     style DATA fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
     style STATE fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
     style MODEL fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
@@ -95,14 +101,17 @@ PostgreSQL is the serving boundary for current RUL and Survival predictions, sta
 The supported environment is Python **>=3.10,<3.14**, Java **>=17**, Docker Compose with the required Compose Specification capabilities, and Linux containers. Use Docker Desktop on macOS; use Docker Desktop with WSL2 and a checkout in the WSL filesystem on Windows. See [the environment guide](docs/environment.md) for prerequisites, data acquisition, service URLs, and clean-clone commands.
 
 ```sh
-python scripts/preflight.py --profile unit
-python -m pytest --tier unit -q
 cp .env.example .env
-python scripts/preflight.py --profile compose
-docker compose up -d
+python scripts/preflight.py --profile full --tracked
+python src/normalize_matr.py
+python src/matr_qc.py
+docker compose up -d postgres kafka spark-master spark-worker-1 spark-worker-2 airflow
+python src/kafka_producer.py
+docker compose run --rm spark-stream-submit
+python src/build_offline_benchmark.py
 ```
 
-Obtain the BatteryLife MATR laboratory archive separately, then follow the data bootstrap commands in [docs/environment.md](docs/environment.md). The repository’s compatibility workflow has validated the supported Python, Spark, Survival, and container paths; desktop full-stack runs remain environment-specific acceptance gates.
+First obtain and checksum the pinned BatteryLife MATR archives, then follow the model-training, deterministic Current-selection, explicit serving-refresh, PostgreSQL-loading, and Dashboard checks in [the environment guide](docs/environment.md). Spark Streaming is the only canonical producer of finalized state and the Shared Feature Outlet.
 
 ## Scope and Limitations
 

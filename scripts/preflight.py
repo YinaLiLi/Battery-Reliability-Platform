@@ -73,22 +73,17 @@ def check(profile, root=ROOT, tracked=False, data=False):
            'Full stack requires Linux containers; Windows: use Docker Desktop + WSL2 and clone inside the Linux filesystem.' if native_windows else platform.system())
     if tracked:
         tracked_files = set(run(['git', 'ls-files'], cwd=root).stdout.splitlines())
-        required = {
-            '.dockerignore', '.env.example', '.gitattributes', '.gitignore',
-            '.github/workflows/ci.yml', 'pytest.ini',
-            'airflow/matr_pipeline.py', 'dashboard/Dockerfile',
-            'dashboard/app.py', 'dashboard/requirements.txt',
-            'sql/001_analytics.sql', 'sql/002_drop_legacy_ev.sql',
-            'sql/003_dashboard_role.sql',
-        }
-        required |= {p.relative_to(root).as_posix() for folder in ('src', 'scripts', 'tests') for p in (root / folder).glob('*.py')}
-        required |= {p.name for p in root.glob('Dockerfile*')} | {p.name for p in root.glob('requirements*.txt')}
-        for filename in ('README.md', 'docker-compose.yml'):
-            contents = (root / filename).read_text(encoding='utf-8')
-            required.update(re.findall(r'(?<![\w/])(?:src|scripts|docs|dashboard|tests)/[\w./-]+\.(?:py|md|txt)', contents))
-            required.update(re.findall(r'dockerfile:\s*(\S+)', contents))
-        missing = sorted(required - tracked_files)
-        record('tracked files', not missing, ', '.join(missing) if missing else 'All referenced source/build files are tracked.')
+        allowlist = root / '.public-files'
+        if not allowlist.exists():
+            record('public files', False, '.public-files is missing.')
+        else:
+            public_files = {line.strip() for line in allowlist.read_text(encoding='utf-8').splitlines() if line.strip() and not line.lstrip().startswith('#')}
+            missing = sorted(public_files - tracked_files)
+            unexpected = sorted(tracked_files - public_files)
+            details = []
+            if missing: details.append('missing: ' + ', '.join(missing))
+            if unexpected: details.append('unexpected: ' + ', '.join(unexpected))
+            record('public files', not details, '; '.join(details) if details else 'Tracked files exactly match .public-files.')
     target = root / 'data' / 'processed'
     while not target.exists():
         target = target.parent

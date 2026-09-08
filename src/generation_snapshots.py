@@ -27,7 +27,9 @@ GENERATION_SNAPSHOTS = (
 
 
 def _time(value):
-    return value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
 
 
 def _checksum(values):

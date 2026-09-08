@@ -40,7 +40,7 @@ DEFAULT_CANONICAL_CYCLES_PATH = Path("data/processed/matr/cycle_summary")
 TOPIC = "battery_measurements"
 LIFECYCLE_TOPIC = "battery_lifecycle"
 SHUFFLE_PARTITIONS = 3
-MAX_OFFSETS_PER_TRIGGER = 100
+MAX_OFFSETS_PER_TRIGGER = int(os.environ.get("SPARK_MAX_OFFSETS_PER_TRIGGER", "5000000"))
 WATERMARK_DELAY = "2 hours"
 
 TELEMETRY_SCHEMA = T.StructType(
@@ -441,8 +441,7 @@ def record_rul_status(spark, manifest, result=None, error=None):
 def _serving_selection(spark, table, evaluation_table):
     url = os.environ.get("POSTGRES_JDBC_URL", "jdbc:postgresql://localhost:5432/battery_reliability")
     props = jdbc_properties(os.environ.get("POSTGRES_USER", "battery_reliability"), os.environ["POSTGRES_PASSWORD"])
-    selected_fingerprint = ", current.model_fingerprint AS selected_fingerprint" if table == "current_survival_models" else ""
-    query = f"(SELECT current.dataset, current.model_version, current.selection_revision, evaluation.model_fingerprint, evaluation.training_metadata{selected_fingerprint} FROM analytics.{table} current JOIN analytics.{evaluation_table} evaluation USING (model_version)) selection"
+    query = f"(SELECT current.dataset, current.model_version, current.selection_revision, evaluation.model_fingerprint, evaluation.training_metadata, current.model_fingerprint AS selected_fingerprint FROM analytics.{table} current JOIN analytics.{evaluation_table} evaluation USING (model_version)) selection"
     rows = spark.read.jdbc(url, query, properties=props).collect()
     return (rows[0].asDict(), url, props) if rows else (None, url, props)
 
@@ -456,22 +455,37 @@ def run_current_rul_inference(spark, state_root, manifest):
     selection, url, props = _serving_selection(spark, "current_models", "model_evaluations")
     if selection is None:
         return {"status": "no_current_model"}
+    if selection["selected_fingerprint"] != selection["model_fingerprint"]:
+        raise RuntimeError("current RUL model fingerprint mismatch")
     import joblib
     metadata = selection["training_metadata"] if isinstance(selection["training_metadata"], dict) else json.loads(selection["training_metadata"])
     if metadata.get("feature_version") != manifest["feature_contract_version"]:
         raise RuntimeError("current RUL model feature contract mismatch")
     model = joblib.load(Path(state_root) / "model_generations" / selection["model_fingerprint"] / "selected_model.joblib")
-    benchmark = json.loads((Path(state_root) / "fixed_offline_benchmark/v1/benchmark.json").read_text())
-    excluded = set(benchmark["splits"]["validation"]["battery_ids"]) | set(benchmark["splits"]["test"]["battery_ids"])
-    features = _latest_features(state_root, manifest, excluded)
+    # Benchmark batteries stay excluded from training/evaluation, but remain
+    # part of the monitoring population when current-cycle features exist.
+    features = _latest_features(state_root, manifest)
     prior = {row.battery_id: row.asDict() for row in spark.read.jdbc(url, "analytics.battery_current_predictions", properties=props).collect()}
-    rows = current_prediction_rows(model, features, feature_columns=RUL_FEATURES, model_version=selection["model_version"], model_fingerprint=selection["model_fingerprint"], state_id=manifest["state_id"], selection_revision=selection["selection_revision"], benchmark_battery_ids=excluded, prior_predictions=prior)
+    rows = current_prediction_rows(model, features, feature_columns=RUL_FEATURES, model_version=selection["model_version"], model_fingerprint=selection["model_fingerprint"], state_id=manifest["state_id"], selection_revision=selection["selection_revision"], prior_predictions=prior)
     if not rows:
         return {"status": "no_eligible_features"}
     stage = "analytics.stream_rul_" + re.sub("[^a-z0-9_]", "_", manifest["state_id"][-16:].lower())
     spark.createDataFrame(rows, CURRENT_PREDICTION_SCHEMA).withColumn("inference_created_at", F.to_timestamp("inference_created_at")).write.jdbc(url, stage, mode="overwrite", properties=props)
     _execute(spark, url, props["user"], props["password"], build_current_prediction_upsert_sql(stage))
     return {"status": "served", "rows": len(rows)}
+
+
+def refresh_current_rul(spark, state_root):
+    """Refresh RUL serving from the latest finalized state without reading Kafka."""
+    manifest = json.loads((Path(state_root) / "stream_state/latest.json").read_text())
+    record_current_stream_state(spark, state_root, manifest)
+    try:
+        result = run_current_rul_inference(spark, state_root, manifest)
+        record_rul_status(spark, manifest, result)
+        return result
+    except Exception as error:
+        record_rul_status(spark, manifest, error=error)
+        raise
 
 
 def start_query(spark, output_path, checkpoint_path, lifecycle_output_path=DEFAULT_LIFECYCLE_OUTPUT_PATH, completed_cycles_path=DEFAULT_COMPLETED_CYCLES_PATH, offset_watermarks_path=DEFAULT_KAFKA_OFFSETS_PATH, state_root=DEFAULT_STATE_ROOT, canonical_fingerprint="matr-canonical-v1", arrival_manifest_fingerprint=None, available_now=False, arrival_manifest_path=DEFAULT_ARRIVAL_MANIFEST_PATH, canonical_cycles_path=DEFAULT_CANONICAL_CYCLES_PATH):
@@ -532,6 +546,7 @@ def parse_args():
     parser.add_argument("--arrival-manifest-path", type=Path, default=DEFAULT_ARRIVAL_MANIFEST_PATH)
     parser.add_argument("--canonical-cycles-path", type=Path, default=DEFAULT_CANONICAL_CYCLES_PATH)
     parser.add_argument("--available-now", action="store_true", help="Process current offsets in bounded micro-batches, then exit.")
+    parser.add_argument("--refresh-current", action="store_true", help="Refresh RUL from latest finalized state without consuming Kafka.")
     return parser.parse_args()
 
 
@@ -540,6 +555,9 @@ def main():
     spark = build_spark_session(args.master)
     spark.sparkContext.setLogLevel("WARN")
     try:
+        if args.refresh_current:
+            print(refresh_current_rul(spark, args.state_root))
+            return
         query = start_query(spark, args.output_path, args.checkpoint_path, args.lifecycle_output_path, args.completed_cycles_path,
             args.offset_watermarks_path, args.state_root, args.canonical_fingerprint, args.arrival_manifest_fingerprint,
             args.available_now, args.arrival_manifest_path, args.canonical_cycles_path)

@@ -430,7 +430,14 @@ def load_current_feature_rows(root, manifest, *, excluded_battery_ids=()):
         sequence = sequences.get((row["dataset"], row["battery_id"]))
         if sequence is not None:
             row["replay_sequence"] = sequence
+        else:
+            row.setdefault("replay_sequence", 0)
     return [latest[battery] for battery in sorted(latest)]
+
+
+def load_current_monitoring_feature_rows(root, manifest):
+    """Load each battery's newest finalized row from the Shared Feature Outlet."""
+    return load_current_feature_rows(root, manifest)
 
 
 def _cohort_checksums(state):

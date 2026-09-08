@@ -74,7 +74,7 @@ with DAG(
         mounts=[Mount(source=os.environ["HOST_PROJECT_ROOT"], target="/opt/project", type="bind")],
         environment={"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1"},
         network_mode="none",
-        mem_limit="2g",
+        mem_limit="4g",
         cpus=1.0,
         auto_remove="success",
         mount_tmp_dir=False,

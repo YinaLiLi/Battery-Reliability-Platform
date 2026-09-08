@@ -1,8 +1,10 @@
 """Replay canonical MATR measurements to Kafka."""
 
 import argparse
+import heapq
 import json
 import os
+from itertools import chain, groupby
 from pathlib import Path
 
 import pyarrow.dataset as ds
@@ -80,6 +82,59 @@ def scheduled_replay_events(measurements, manifest, *, include_lifecycle=True):
         yield {**event, "replay_sequence": sequence}
 
 
+def _replay_sort_key(item):
+    priority, event = item
+    return (event["replay_event_time"], priority, event["battery_id"], event.get("cycle_index", 0), event.get("sample_index", 0))
+
+
+def _fragment_rows(fragment):
+    for batch in fragment.to_batches(batch_size=1000):
+        yield from batch.to_pylist()
+
+
+def _battery_replay_events(rows, manifest_row):
+    def telemetry_and_completions():
+        for cycle_index, cycle in groupby(rows, key=lambda row: row["cycle_index"]):
+            scheduled = [schedule_measurement(row, manifest_row, replay_sequence=0) for row in cycle]
+            yield from ((0, row) for row in scheduled)
+            last = max(scheduled, key=lambda row: row["replay_event_time"])
+            yield 1, {
+                "event_id": f"matr-lifecycle:{last['battery_id']}:cycle_complete:{cycle_index}",
+                "event_type": "cycle_complete",
+                "dataset": last["dataset"],
+                "battery_id": last["battery_id"],
+                "cycle_index": cycle_index,
+                "expected_telemetry_rows": len(scheduled),
+                "replay_event_time": last["replay_event_time"],
+                "schema_version": "1.0",
+            }
+
+    lifecycle = [
+        (2 if event["event_type"] == "eol_observed" else 3, event)
+        for event in lifecycle_events_for_manifest(manifest_row)
+    ]
+    yield from heapq.merge(telemetry_and_completions(), lifecycle, key=_replay_sort_key)
+
+
+def scheduled_replay_dataset(path, manifest):
+    """Merge one normalized battery fragment at a time without holding the corpus in RAM."""
+    by_battery = {row["battery_id"]: row for row in manifest}
+    streams, seen = [], set()
+    for fragment in ds.dataset(path, format="parquet").get_fragments():
+        rows = iter(_fragment_rows(fragment))
+        try:
+            first = next(rows)
+        except StopIteration:
+            continue
+        battery_id = first["battery_id"]
+        if battery_id in seen:
+            raise ValueError(f"normalized replay requires one fragment per battery: {battery_id}")
+        seen.add(battery_id)
+        streams.append(_battery_replay_events(chain([first], rows), by_battery[battery_id]))
+    for sequence, (_, event) in enumerate(heapq.merge(*streams, key=_replay_sort_key)):
+        yield {**event, "replay_sequence": sequence}
+
+
 def produce_rows(rows, producer, limit=1000):
     """Queue telemetry for asynchronous delivery and raise only after flushing."""
     delivery_errors = []
@@ -135,11 +190,15 @@ def main():
             "acks": "all",
         }
     )
-    measurements = telemetry_rows(args.input, args.limit, set(args.battery_ids or []), args.limit_per_battery)
     manifest = ds.dataset(args.manifest, format="parquet").to_table().to_pylist()
     if args.battery_ids:
         manifest = [row for row in manifest if row["battery_id"] in set(args.battery_ids)]
-    sent = produce_rows(scheduled_replay_events(measurements, manifest, include_lifecycle=not args.limit and not args.limit_per_battery), producer, 0)
+    if not args.limit and not args.battery_ids and not args.limit_per_battery:
+        replay = scheduled_replay_dataset(args.input, manifest)
+    else:
+        measurements = telemetry_rows(args.input, args.limit, set(args.battery_ids or []), args.limit_per_battery)
+        replay = scheduled_replay_events(measurements, manifest, include_lifecycle=not args.limit and not args.limit_per_battery)
+    sent = produce_rows(replay, producer, 0)
     print(f"Delivered {sent} scheduled event(s) to {TOPIC} and {LIFECYCLE_TOPIC}.")
 
 
