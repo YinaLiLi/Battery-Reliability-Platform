@@ -16,6 +16,7 @@ dashboard/app.py
 dashboard/requirements.txt
 docker-compose.yml
 docs/environment.md
+docs/architecture.md
 requirements.spark.txt
 requirements.survival-serving.txt
 requirements.survival-training.txt

@@ -1,12 +1,81 @@
 # Battery Reliability & Predictive Analytics Platform
 
-An end-to-end battery reliability and predictive analytics platform that processes progressive telemetry into time-consistent battery health state, RUL and survival predictions, and operational monitoring. BatteryLife MATR laboratory data is replayed through Kafka to simulate progressive real-world battery telemetry and lifecycle arrival for reproducible development and evaluation; this repository does not receive live production telemetry.
+An end-to-end platform for turning progressive battery telemetry into time-consistent health state, Remaining Useful Life (RUL), and Survival predictions. It replays the laboratory BatteryLife MATR dataset—169 batteries, 140K cycles, and 130M+ measurements—through Kafka and Spark to demonstrate streaming ML, PostgreSQL serving, and operational monitoring.
 
-The MIT License covers this repository's project code. Externally sourced BatteryLife/MATR archives and labels are not covered by this license; obtain and use them under their original source/provider terms.
+## Highlights
 
-## Results at a Glance
+- Processes 130M+ laboratory measurements across a 169-battery monitoring population.
+- Runs deterministic progressive replay with Kafka and Spark Structured Streaming.
+- Improves RUL MAE from ~98 cycles (Generation 1.0) to ~39 cycles (Generation 1.3); R² rises from ~0.67 to ~0.94.
+- Trains RUL and Survival independently from the same persistent Shared Feature Outlet.
+- Serves Current models and predictions through PostgreSQL and a Streamlit dashboard.
+- Verified clean-fork workflow from raw MATR archives through the Dashboard.
 
-Evaluation uses the canonical BatteryLife MATR laboratory corpus (169 batteries, 140,001 cycles, and 130,573,638 measurements). The fixed benchmark is held out from training and generation-cutoff selection.
+## Dashboard
+
+The working Streamlit dashboard covers fleet risk, battery detail, RUL model monitoring, and Survival model monitoring.
+
+<!-- TODO: add a real dashboard screenshot from a verified run; do not use a synthetic image. -->
+
+## Architecture
+
+### Simplified flow
+
+```mermaid
+flowchart TB
+  subgraph SRC["DATA SOURCE"]
+    BAT["BatteryLife MATR Dataset"]
+  end
+
+  subgraph ING["DATA & INGESTION (Kafka)"]
+    I1["Telemetry / Lifecycle Data"]
+  end
+
+  subgraph STR["STREAMING & STATE (Kafka · Spark Structured Streaming)"]
+    ST1["Event processing"]
+    ST2["Prefix-complete finalized battery state"]
+    ST1 --> ST2
+  end
+
+  subgraph FS["FEATURE & RELIABILITY STATE (Spark · Parquet)"]
+    F1["Persistent Shared Feature Outlet"]
+    F2["Cumulative feature state"]
+    F1 --> F2
+  end
+
+  subgraph OM["ORCHESTRATION & MODELING (Airflow · Spark · XGBoost · scikit-learn · scikit-survival)"]
+    OM1["Generation / model orchestration"]
+    OM2["parallel RUL and Survival modeling"]
+    OM1 --> OM2
+  end
+
+  subgraph SM["SERVING & MONITORING (Airflow · PostgreSQL · Streamlit)"]
+    S1["Current RUL / Survival models"]
+    S2["Current predictions"]
+    S3["Operational dashboard"]
+    S1 --> S2
+    S2 --> S3
+  end
+
+  BAT --> I1
+  I1 --> ST1
+  ST2 --> F1
+  F2 --> OM1
+  OM2 --> S1
+
+classDef layerBox fill:none,stroke:#6b7280,stroke-width:2px,stroke-dasharray:4 4;
+classDef sourceBox fill:#f8fafc,stroke:#374151,stroke-width:2px;
+class SRC sourceBox
+class ING layerBox
+class STR layerBox
+class FS layerBox
+class OM layerBox
+class SM layerBox
+```
+
+**[View the detailed architecture →](docs/architecture.md)**
+
+## Model Performance
 
 ### RUL fixed-test results
 
@@ -26,93 +95,36 @@ Evaluation uses the canonical BatteryLife MATR laboratory corpus (169 batteries,
 | 1.2 | RSF | 76 | 0.01929 | 0.8199 |
 | 1.3 | RSF | 94 | 0.01966 | 0.8349 |
 
-MAE/RMSE and integrated Brier are lower-is-better; R² and IPCW C-index are higher-is-better. Model-family selection uses validation data only.
+MAE/RMSE and integrated Brier are lower-is-better; R² and IPCW C-index are higher-is-better. Validation selects model family/configuration; the fixed test set is held out from training and selection.
 
-## Architecture
+## How It Works
 
-```mermaid
-flowchart TD
-    subgraph DATA["DATA"]
-        MATR["BatteryLife MATR laboratory data"] --> CANON["Canonical cycle and measurement data"]
-        CANON --> REPLAY["Deterministic progressive replay"]
-        REPLAY --> KAFKA["Kafka telemetry and lifecycle events"]
-    end
+1. Deterministic MATR cycle and lifecycle data are replayed through Kafka.
+2. Spark Structured Streaming finalizes prefix-complete cycles and appends rows to the persistent Shared Feature Outlet.
+3. Airflow trains and evaluates RUL and Survival generation models from that shared outlet.
+4. Selected Current models publish predictions to PostgreSQL, where the Dashboard reads them for monitoring.
 
-    subgraph STATE["STREAMING & STATE"]
-        KAFKA --> SPARK["Spark Structured Streaming"]
-        SPARK --> FINAL["Prefix-complete finalized state"]
-        FINAL --> OUTLET["Persistent append-only Shared Feature Outlet"]
-    end
+## Tech Stack
 
-    subgraph MODEL["MODEL TRAINING"]
-        AIRFLOW["Airflow orchestration"] --> SELECT["Cumulative Generation ID selection"]
-        OUTLET --> SELECT
-        SELECT --> RULTRAIN["RUL training and evaluation"]
-        SELECT --> SURVTRAIN["Survival training and evaluation"]
-        RULTRAIN --> RULCAND["RUL candidate models"]
-        SURVTRAIN --> SURVCAND["Survival candidate models"]
-        RULCAND --> RULPROMO["Select and publish RUL model"]
-        SURVCAND --> SURVPROMO["Select and publish Survival model"]
-        BENCH["Fixed validation and test benchmark"] -.-> RULTRAIN
-        BENCH -.-> SURVTRAIN
-    end
+Python · PySpark · Kafka · Spark Structured Streaming · Airflow · PostgreSQL · XGBoost · scikit-learn · scikit-survival · Streamlit · Docker
 
-    subgraph SERVE["CURRENT SERVING"]
-        OUTLET --> CURRENT["Newest finalized cumulative rows"]
-        RULPROMO --> RULMODEL["Current RUL model"]
-        SURVPROMO --> SURVMODEL["Current Survival model"]
-        CURRENT --> RULMODEL
-        CURRENT --> SURVMODEL
-        RULMODEL --> PG["PostgreSQL"]
-        SURVMODEL --> PG
-        PG --> DASH["Streamlit monitoring dashboard"]
-    end
-
-    classDef component fill:transparent,stroke:#9ca3af,color:#374151;
-    class MATR,CANON,REPLAY,KAFKA,SPARK,FINAL,OUTLET,AIRFLOW,SELECT,RULTRAIN,SURVTRAIN,RULCAND,SURVCAND,RULPROMO,SURVPROMO,BENCH,CURRENT,RULMODEL,SURVMODEL,PG,DASH component;
-    style DATA fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
-    style STATE fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
-    style MODEL fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
-    style SERVE fill:transparent,stroke:#5b6573,stroke-width:3px,stroke-dasharray:8 4;
-```
-
-The Shared Feature Outlet is the common upstream outlet for both model families and current inference. New finalized cycle rows are appended once. Generation *N* consumes all outlet rows with `generation_id <= N`; RUL and Survival then apply their own labels, event semantics, and model-specific transformations to the same selected rows.
-
-## Progressive Telemetry Simulation
-
-BatteryLife MATR is the current laboratory source used to exercise the platform. Its canonical cycle and measurement data are replayed progressively through Kafka, with lifecycle events and cycle-completion boundaries preserved in time order. Spark streaming deduplicates events and admits only prefix-complete cycles, preventing later telemetry from changing an earlier finalized state.
-
-## Modeling and Evaluation
-
-State-bound features use only the current cycle and prior finalized history. RUL predicts remaining cycles to the source-supported approximately 80% SOH endpoint. Survival models estimate event and censoring behavior over time using Cox proportional hazards and Random Survival Forest candidates.
-
-The platform evaluates multiple candidate families against a fixed, immutable benchmark of 34 validation batteries and 34 test batteries. Validation selects a family/configuration; the fixed test set is evaluated once for the selected winner and is never used for training or streaming cutoff selection.
-
-## Generation IDs and Continuous Training
-
-Airflow validates the finalized state, selects the cumulative shared-outlet rows for a generation, and fans those same rows out to parallel RUL and Survival training. A later generation appends only newly finalized rows; it does not rebuild or copy the historical feature dataset. Existing candidate models remain immutable, while Current Model selections are managed independently.
-
-## Dashboard and Operational Use
-
-PostgreSQL is the serving boundary for current RUL and Survival predictions, state availability, and model health. The Streamlit dashboard provides battery-level detail, current health and RUL views, survival horizons, cohort context, and operational model status. Candidate and historical predictions remain available for comparison and audit.
-
-## Quick Start
-
-The supported environment is Python **>=3.10,<3.14**, Java **>=17**, Docker Compose with the required Compose Specification capabilities, and Linux containers. Use Docker Desktop on macOS; use Docker Desktop with WSL2 and a checkout in the WSL filesystem on Windows. See [the environment guide](docs/environment.md) for prerequisites, data acquisition, service URLs, and clean-clone commands.
+## Setup
 
 ```sh
 cp .env.example .env
 python scripts/preflight.py --profile full --tracked
-python src/normalize_matr.py
-python src/matr_qc.py
-docker compose up -d postgres kafka spark-master spark-worker-1 spark-worker-2 airflow
-python src/kafka_producer.py
-docker compose run --rm spark-stream-submit
-python src/build_offline_benchmark.py
 ```
 
-First obtain and checksum the pinned BatteryLife MATR archives, then follow the model-training, deterministic Current-selection, explicit serving-refresh, PostgreSQL-loading, and Dashboard checks in [the environment guide](docs/environment.md). Spark Streaming is the only canonical producer of finalized state and the Shared Feature Outlet.
+The setup commands only prepare and validate the local environment; they do not run the full platform.
 
-## Scope and Limitations
+**Run the Full Platform → [docs/environment.md](docs/environment.md)**
 
-This is a reproducible laboratory-data demonstration, not a live field-telemetry deployment. Kafka replay simulates progressive arrival deterministically; it does not represent production network behavior or field coverage. Results depend on the current laboratory cohort, feature contract, and benchmark definitions. The complete demonstration includes RUL, conditional Survival, parallel training, PostgreSQL serving, a Linux `amd64` Survival runtime, and Streamlit monitoring.
+Install the public requirements, obtain the pinned MATR archives, and follow the complete normalization, streaming, training, serving, and Dashboard workflow in [docs/environment.md](docs/environment.md).
+
+## Data & Evaluation
+
+BatteryLife MATR is the laboratory data source used to simulate progressive telemetry; this project is not a live production-telemetry system. The canonical cohort contains 169 batteries, including 101 training, 34 validation, and 34 test batteries. Validation and test batteries are excluded from training; validation selects models, while the fixed test benchmark is held out for final reporting.
+
+## Scope / License
+
+This is a reproducible laboratory-data demonstration of battery reliability and predictive analytics, not a production deployment. The MIT License covers this repository's code. BatteryLife/MATR archives and labels are externally sourced and remain subject to their original provider/source terms.
