@@ -8,6 +8,8 @@ import platform
 import re
 import subprocess
 import sys
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_CAPABILITIES = (
@@ -93,21 +95,28 @@ def check(profile, root=ROOT, tracked=False, data=False):
     manifests = [] if profile == 'compose' else ['requirements.txt']
     for filename in manifests:
         for line in (root / filename).read_text().splitlines():
-            match = re.fullmatch(r'([\w-]+)(?:\[.*?\])?([<>=!].*)', line)
-            if not match:
+            line = line.strip()
+            if not line or line.startswith('#'):
                 continue
-            name, expected = match.groups()
+            try:
+                req = Requirement(line)
+            except Exception:
+                continue
+            name = req.name
+            expected = str(req.specifier)
             if profile in ('unit', 'spark') and name == 'scikit-survival':
+                continue
+            if not expected:
                 continue
             try:
                 actual = importlib.metadata.version(name)
+                compatible = req.specifier.contains(actual, prereleases=True)
             except importlib.metadata.PackageNotFoundError:
                 actual = 'missing'
-            try:
-                from packaging.specifiers import SpecifierSet
-                compatible = actual != 'missing' and actual in SpecifierSet(expected)
-            except ImportError:
-                compatible = expected == '==' + actual
+                compatible = False
+            except Exception:
+                actual = 'missing'
+                compatible = False
             record(name, compatible, f'{actual}; expected {expected} from {filename}; install with python -m pip install -r {filename}')
     if profile in ('spark', 'full'):
         worker = os.environ.get('PYSPARK_PYTHON', sys.executable)
