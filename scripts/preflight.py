@@ -8,8 +8,57 @@ import platform
 import re
 import subprocess
 import sys
-from packaging.requirements import Requirement
-from packaging.specifiers import SpecifierSet
+try:
+    from packaging.requirements import Requirement  # type: ignore
+except ModuleNotFoundError:
+    Requirement = None
+
+
+def _fallback_compatible(expected, actual):
+    if not expected:
+        return True
+    if actual is None:
+        return False
+    def _version_tuple(value):
+        return tuple(int(part) if part.isdigit() else part for part in str(value).replace('-', '.').split('.'))
+
+    def _version_cmp(left, right):
+        left = list(left)
+        right = list(right)
+        max_len = max(len(left), len(right))
+        while len(left) < max_len:
+            left.append(0)
+        while len(right) < max_len:
+            right.append(0)
+        return (left > right) - (left < right)
+
+    actual_version = _version_tuple(actual)
+    for part in [p.strip() for p in expected.split(',') if p.strip()]:
+        match = re.fullmatch(r'(?P<op>==|!=|~=|>=|<=|>|<)\s*(?P<version>[0-9][0-9A-Za-z.+-]*)', part)
+        if not match:
+            return False
+        op = match.group('op')
+        target_version = _version_tuple(match.group('version'))
+        if op == '==':
+            ok = _version_cmp(actual_version, target_version) == 0
+        elif op == '!=':
+            ok = _version_cmp(actual_version, target_version) != 0
+        elif op == '>=':
+            ok = _version_cmp(actual_version, target_version) >= 0
+        elif op == '<=':
+            ok = _version_cmp(actual_version, target_version) <= 0
+        elif op == '>':
+            ok = _version_cmp(actual_version, target_version) > 0
+        elif op == '<':
+            ok = _version_cmp(actual_version, target_version) < 0
+        elif op == '~=':
+            # Approximate compatible release operator for fallback (PEP 440 semantics are preferred when packaging is available).
+            ok = _version_cmp(actual_version, target_version) >= 0
+        else:
+            ok = False
+        if not ok:
+            return False
+    return True
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_CAPABILITIES = (
@@ -97,6 +146,25 @@ def check(profile, root=ROOT, tracked=False, data=False):
         for line in (root / filename).read_text().splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
+                continue
+            if Requirement is None:
+                # Minimal fallback parsing for lines like "name<op>version" and "name[extra]<op>version".
+                match = re.fullmatch(r'([\w-]+)(?:\[.*?\])?(.+)', line)
+                if not match:
+                    continue
+                name = match.group(1)
+                expected = match.group(2)
+                if profile in ('unit', 'spark') and name == 'scikit-survival':
+                    continue
+                if not expected:
+                    continue
+                try:
+                    actual = importlib.metadata.version(name)
+                    compatible = _fallback_compatible(expected, actual)
+                except importlib.metadata.PackageNotFoundError:
+                    actual = 'missing'
+                    compatible = False
+                record(name, compatible, f'{actual}; expected {expected} from {filename}; install with python -m pip install -r {filename}')
                 continue
             try:
                 req = Requirement(line)
