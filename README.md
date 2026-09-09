@@ -13,7 +13,9 @@ An end-to-end platform that retrains and evaluates RUL and Survival models as pr
 
 The working Streamlit dashboard covers fleet risk, battery detail, RUL model monitoring, and Survival model monitoring.
 
-<!-- TODO: add a real dashboard screenshot from a verified run; do not use a synthetic image. -->
+![Dashboard demo: fleet risk monitoring and model evaluation](docs/images/dashboard-demo.gif)
+
+Dashboard walkthrough of fleet, battery, and model monitoring in one run.
 
 ## Architecture
 
