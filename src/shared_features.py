@@ -436,8 +436,32 @@ def load_current_feature_rows(root, manifest, *, excluded_battery_ids=()):
 
 
 def load_current_monitoring_feature_rows(root, manifest):
-    """Load each battery's newest finalized row from the Shared Feature Outlet."""
-    return load_current_feature_rows(root, manifest)
+    """Load each monitoring battery's newest model-compatible feature row."""
+    root = Path(root)
+    source = root / "degradation_features"
+    if not source.exists():
+        return load_current_feature_rows(root, manifest)
+
+    try:
+        from .feature_contract import RUL_FEATURES, finite_number
+    except ImportError:
+        from feature_contract import RUL_FEATURES, finite_number
+    expected_contract = _hash_bytes(",".join(RUL_FEATURES).encode())
+    if manifest["feature_contract_version"].rsplit(":", 1)[-1] != expected_contract:
+        raise ValueError("current monitoring feature contract mismatch")
+
+    rows = ds.dataset(source, format="parquet").to_table().to_pylist()
+    required = {"dataset", "battery_id", *RUL_FEATURES}
+    if not rows or not required.issubset(rows[0]):
+        raise ValueError("current monitoring features do not satisfy the model contract")
+    latest = {}
+    for row in rows:
+        if not all(finite_number(row.get(feature)) is not None for feature in RUL_FEATURES):
+            continue
+        prior = latest.get(row["battery_id"])
+        if prior is None or int(row["cycle_index"]) > int(prior["cycle_index"]):
+            latest[row["battery_id"]] = {**row, "replay_sequence": 0}
+    return [latest[battery] for battery in sorted(latest)]
 
 
 def _cohort_checksums(state):
