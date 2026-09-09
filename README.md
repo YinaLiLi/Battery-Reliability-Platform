@@ -1,15 +1,13 @@
-# Battery Reliability & Predictive Analytics Platform
+# Automated Battery Reliability & Predictive Analytics Platform
 
-An end-to-end platform for turning progressive battery telemetry into time-consistent health state, Remaining Useful Life (RUL), and Survival predictions. It replays the laboratory BatteryLife MATR dataset—169 batteries, 140K cycles, and 130M+ measurements—through Kafka and Spark to demonstrate streaming ML, PostgreSQL serving, and operational monitoring.
+An end-to-end platform that retrains and evaluates RUL and Survival models as progressive telemetry arrives, serves Current models, and powers real-time fleet and battery monitoring. It maintains incremental feature state without rebuilding history; BatteryLife MATR simulates production telemetry, with 130M+ measurements as supporting scale.
 
 ## Highlights
 
-- Processes 130M+ laboratory measurements across a 169-battery monitoring population.
-- Runs deterministic progressive replay with Kafka and Spark Structured Streaming.
-- Improves RUL MAE from ~98 cycles (Generation 1.0) to ~39 cycles (Generation 1.3); R² rises from ~0.67 to ~0.94.
-- Trains RUL and Survival independently from the same persistent Shared Feature Outlet.
+- Automatically retrains and evaluates RUL and Survival models as new telemetry arrives.
 - Serves Current models and predictions through PostgreSQL and a Streamlit dashboard.
-- Verified clean-fork workflow from raw MATR archives through the Dashboard.
+- Monitors fleet risk and individual battery health in real time.
+- Appends incremental feature state to the Shared Feature Outlet without rebuilding history.
 
 ## Dashboard
 
@@ -19,58 +17,56 @@ The working Streamlit dashboard covers fleet risk, battery detail, RUL model mon
 
 ## Architecture
 
-### Simplified flow
-
 ```mermaid
-flowchart TB
-  subgraph SRC["DATA SOURCE"]
-    BAT["BatteryLife MATR Dataset"]
+flowchart TD
+  classDef layer fill:transparent,stroke:#6b7280,stroke-width:2px,stroke-dasharray:5 4;
+  classDef context fill:none,stroke:none,color:inherit,width:300px;
+  classDef spacer fill:none,stroke:none,width:100px;
+
+  subgraph ROWA[" "]
+    direction LR
+    A["<div style='width:360px;text-align:center'>Battery telemetry / lifecycle data</div>"]:::layer
+    A_gap[" "]:::spacer
+    A_info["<div style='width:320px;text-align:left'><b>DATA SOURCE</b><br/><i>BatteryLife MATR</i></div>"]:::context
+  end
+  subgraph ROWB[" "]
+    direction LR
+    B["<div style='width:360px;text-align:center'>Progressive telemetry ingestion</div>"]:::layer
+    B_gap[" "]:::spacer
+    B_info["<div style='width:320px;text-align:left'><b>DATA & INGESTION</b><br/><i>Kafka</i></div>"]:::context
+  end
+  subgraph ROWC[" "]
+    direction LR
+    C["<div style='width:360px;text-align:center'>Event processing<br/>Prefix-complete finalized battery state</div>"]:::layer
+    C_gap[" "]:::spacer
+    C_info["<div style='width:320px;text-align:left'><b>STREAMING & STATE</b><br/><i>Kafka · Spark Structured Streaming</i></div>"]:::context
+  end
+  subgraph ROWD[" "]
+    direction LR
+    D["<div style='width:360px;text-align:center'>Persistent Shared Feature Outlet<br/>Cumulative feature state</div>"]:::layer
+    D_gap[" "]:::spacer
+    D_info["<div style='width:320px;text-align:left'><b>FEATURE & RELIABILITY STATE</b><br/><i>Spark · Parquet</i></div>"]:::context
+  end
+  subgraph ROWE[" "]
+    direction LR
+    E["<div style='width:360px;text-align:center'>Generation / model orchestration<br/>RUL + Survival modeling</div>"]:::layer
+    E_gap[" "]:::spacer
+    E_info["<div style='width:320px;text-align:left'><b>ORCHESTRATION & MODELING</b><br/><i>Airflow · Spark · XGBoost<br/>scikit-learn · scikit-survival</i></div>"]:::context
+  end
+  subgraph ROWF[" "]
+    direction LR
+    F["<div style='width:360px;text-align:center'>Current RUL / Survival models<br/>Current predictions<br/>Operational dashboard</div>"]:::layer
+    F_gap[" "]:::spacer
+    F_info["<div style='width:320px;text-align:left'><b>SERVING & MONITORING</b><br/><i>Airflow · PostgreSQL · Streamlit</i></div>"]:::context
   end
 
-  subgraph ING["DATA & INGESTION (Kafka)"]
-    I1["Telemetry / Lifecycle Data"]
-  end
-
-  subgraph STR["STREAMING & STATE (Kafka · Spark Structured Streaming)"]
-    ST1["Event processing"]
-    ST2["Prefix-complete finalized battery state"]
-    ST1 --> ST2
-  end
-
-  subgraph FS["FEATURE & RELIABILITY STATE (Spark · Parquet)"]
-    F1["Persistent Shared Feature Outlet"]
-    F2["Cumulative feature state"]
-    F1 --> F2
-  end
-
-  subgraph OM["ORCHESTRATION & MODELING (Airflow · Spark · XGBoost · scikit-learn · scikit-survival)"]
-    OM1["Generation / model orchestration"]
-    OM2["parallel RUL and Survival modeling"]
-    OM1 --> OM2
-  end
-
-  subgraph SM["SERVING & MONITORING (Airflow · PostgreSQL · Streamlit)"]
-    S1["Current RUL / Survival models"]
-    S2["Current predictions"]
-    S3["Operational dashboard"]
-    S1 --> S2
-    S2 --> S3
-  end
-
-  BAT --> I1
-  I1 --> ST1
-  ST2 --> F1
-  F2 --> OM1
-  OM2 --> S1
-
-classDef layerBox fill:none,stroke:#6b7280,stroke-width:2px,stroke-dasharray:4 4;
-classDef sourceBox fill:#f8fafc,stroke:#374151,stroke-width:2px;
-class SRC sourceBox
-class ING layerBox
-class STR layerBox
-class FS layerBox
-class OM layerBox
-class SM layerBox
+  A --> B --> C --> D --> E --> F
+  style ROWA fill:none,stroke:none
+  style ROWB fill:none,stroke:none
+  style ROWC fill:none,stroke:none
+  style ROWD fill:none,stroke:none
+  style ROWE fill:none,stroke:none
+  style ROWF fill:none,stroke:none
 ```
 
 **[View the detailed architecture →](docs/architecture.md)**
@@ -118,8 +114,6 @@ python scripts/preflight.py --profile full --tracked
 The setup commands only prepare and validate the local environment; they do not run the full platform.
 
 **Run the Full Platform → [docs/environment.md](docs/environment.md)**
-
-Install the public requirements, obtain the pinned MATR archives, and follow the complete normalization, streaming, training, serving, and Dashboard workflow in [docs/environment.md](docs/environment.md).
 
 ## Data & Evaluation
 
